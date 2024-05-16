@@ -198,3 +198,11 @@ notebooks_jason/max_of_2_grokking_regularized.html
 *_cache.pkl.lock
 
 lightning_logs/
+
+!notebooks_jason/.cache
+!notebooks_jason/.cache/max_of_4.py.*.bak
+!notebooks_jason/.cache/max_of_4.py.*.dat
+!notebooks_jason/.cache/max_of_4.py.*.dir
+!notebooks_jason/.cache/max_of_4.py.*.db
+!notebooks_jason/.cache/max_of_4.py.*.pkl
+!notebooks_jason/.cache/max_of_4.py.*.pkl.lock
