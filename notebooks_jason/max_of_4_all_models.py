@@ -192,6 +192,10 @@ import gbmi.exp_max_of_n.verification.cubic as cubic
 import gbmi.exp_max_of_n.verification.subcubic as subcubic
 import gbmi.exp_max_of_n.analysis.quadratic as analysis_quadratic
 import gbmi.exp_max_of_n.analysis.subcubic as analysis_subcubic
+from gbmi.exp_max_of_n.analysis.ablation import (
+    compute_ablations,
+    latexify_ablation_results,
+)
 from argparse import ArgumentParser, Namespace, BooleanOptionalAction
 import gbmi.utils.ein as ein
 import gbmi.utils.instructions as instructions
@@ -709,11 +713,11 @@ def get_brute_force_for(seed: int, *, pbar: tqdm):
                 (loss, accuracy, size), duration = run_batch_loss_accuracy(i, batch_size)  # type: ignore
                 total_duration += duration
                 # Accumulate loss and accuracy
-                start = time.time()
+                # start = time.time()
                 total_loss += loss * size
                 total_accuracy += accuracy * size
                 total_samples += size
-                total_duration += time.time() - start
+                # total_duration += time.time() - start
                 # all_incorrect_sequences.append(incorrect_sequences)
                 pbar.update(batch_size)
 
@@ -797,6 +801,55 @@ for key, latex_key in (
     latex_values |= data_summary(brute_force_data_by_key[key], prefix=latex_key)
     assert all(isinstance(seed, int) for seed in brute_force_data_by_key[key].keys())
     latex_all_values_by_value[f"{latex_key}Float"] = brute_force_data_by_key[key]
+
+# %% [markdown]
+# # Ablations
+# %%
+ablation_data = {}
+
+
+def get_ablation_for(seed: int, *, pbar: tqdm):
+    cfg = cfgs[seed]
+    cfg_hash = cfg_hashes[seed]
+    cfg_hash_for_filename = cfg_hashes_for_filename[seed]
+    runtime, model = runtime_models[seed]
+
+    with memoshelve(
+        partial(compute_ablations, model, pbar=pbar),
+        filename=cache_dir
+        / f"{SHARED_CACHE_STEM}.compute_ablations-{cfg_hash_for_filename}",
+        get_hash=get_hash_ascii,
+        get_hash_mem=str,
+    )() as memo_compute_ablations:
+        ablation_results, ablation_time = memo_compute_ablations()
+    return latexify_ablation_results(ablation_results, float_postfix="", int_postfix="")
+
+
+def _handle_ablation_for(seed: int, *, pbar: tqdm):
+    try:
+        pbar.set_postfix(dict(seed=seed))
+        ablation_data[seed] = get_ablation_for(seed, pbar=pbar)
+    except Exception as e:
+        print(f"Error computing ablation for seed {seed}: {e}")
+        traceback.print_exc()
+
+
+all_d_vocabs = [model.cfg.d_vocab for _runtime, model in runtime_models.values()]
+assert len(set(all_d_vocabs)) == 1, f"Multiple d_vocabs: {all_d_vocabs}"
+
+with tqdm(total=sum(all_d_vocabs), desc="batches for ablations", position=0) as pbar:
+    # with PeriodicGarbageCollector(60):
+    maybe_parallel_map(partial(_handle_ablation_for, pbar=pbar), sorted(all_seeds))
+# %%
+ablation_data_by_key = defaultdict(dict)
+for seed, d in ablation_data.items():
+    for k, v in d.items():
+        ablation_data_by_key[k][seed] = v
+
+for key, values in ablation_data_by_key.items():
+    latex_values |= data_summary(values, prefix=key)
+    assert all(isinstance(seed, int) for seed in values.keys())
+    latex_all_values_by_value[f"{key}Float"] = values
 
 # %% [markdown]
 # # Cubic proof

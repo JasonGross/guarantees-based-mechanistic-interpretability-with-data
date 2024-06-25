@@ -9,6 +9,7 @@ from torch import Tensor
 from tqdm.auto import tqdm
 from transformer_lens import HookedTransformer
 from gbmi.utils import ein
+from gbmi.analysis_tools.utils import data_summary
 from gbmi.utils.sequences import generate_all_sequences
 
 
@@ -44,9 +45,11 @@ class AblationOptions:
         return hash((self.EU, self.EQKE, self.EQKP, self.EVOU, self.PVOU))
 
 
-@torch.no_grad
+@torch.no_grad()
 def compute_ablations(
-    model: HookedTransformer, max_incorrect_sequences: int = 64
+    model: HookedTransformer,
+    max_incorrect_sequences: int = 64,
+    pbar: Optional[tqdm] = None,
 ) -> Tuple[dict[AblationOptions, dict[str, Union[float, Sequence[int]]]], float]:
     """
     Computes
@@ -116,11 +119,14 @@ def compute_ablations(
         if EU[qtok].argmax() >= qtok
     )
     only_EU_acc = only_EU_count_correct / d_vocab**n_ctx
+    max_tok_range = range(d_vocab)
+    if pbar is None:
+        max_tok_range = tqdm(max_tok_range, desc="maxtok for EU ablation")
     only_EU_loss = (
         EU[0].softmax(dim=-1)[0]
         + sum(
             (maxtok**n_ctx - (maxtok - 1) ** n_ctx) * EU[qtok].softmax(dim=-1)[maxtok]
-            for maxtok in tqdm(range(d_vocab), desc="maxtok for EU ablation")
+            for maxtok in max_tok_range
             for qtok in range(maxtok + 1)
         )
     ) / d_vocab**n_ctx
@@ -146,7 +152,12 @@ def compute_ablations(
                     EU=True, EVOU=True, PVOU=True, EQKE=ablate_EQKE, EQKP=ablate_EQKP
                 )
             ] = ablate_all_result
-    for qtok in tqdm(range(d_vocab), desc="qtok"):
+    qtok_range = range(d_vocab)
+    if pbar is None:
+        qtok_range = tqdm(qtok_range, desc="qtok")
+    for qtok in qtok_range:
+        if pbar is not None:
+            pbar.update(1)
         qEQKE, qEQKP, qEU = EQKE[qtok], EQKP[qtok], EU[qtok]
         all_sequences[:, -1] = qtok
         maxes = pre_query_maxes.clone()
@@ -157,11 +168,13 @@ def compute_ablations(
         EQKPs = EQKPs - EQKPs.max(dim=-1, keepdim=True).values
         EQKEs = EQKEs.exp()
         EQKPs = EQKPs.exp()
+        EQKEPs = EQKEs * EQKPs
         EQKEsum = EQKEs.sum(dim=-1, keepdim=True)
         EQKPsum = EQKPs.sum(dim=-1, keepdim=True)
-        EQKEPs = EQKEs * EQKPs / (EQKEsum + EQKPsum)
+        EQKEPsum = EQKEPs.sum(dim=-1, keepdim=True)
         EQKEs = EQKEs / EQKEsum
         EQKPs = EQKPs / EQKPsum
+        EQKEPs = EQKEPs / EQKEPsum
         # EVOU -= EVOU[:, qtok].unsqueeze(-1)
         # PVOU -= PVOU[:, qtok].unsqueeze(-1)
         # EU -= EU[:, qtok].unsqueeze(-1)
@@ -209,3 +222,37 @@ def compute_ablations(
         v["num_incorrect_sequences"] = d_vocab**n_ctx - v["num_correct_sequences"]
     end = time.time() - start
     return normalize_result(result), end
+
+
+def latexify_ablation_results(
+    ablation_results: dict[AblationOptions, dict[str, Union[float, Sequence[int]]]],
+    float_postfix: str = "Float",
+    int_postfix: str = "",
+) -> dict[str, float]:
+    latex_values = {}
+    summary_latex_values_lists = defaultdict(list)
+    for k in sorted(ablation_results.keys(), key=AblationOptions.short_description):
+        d = ablation_results[k]
+        for key in sorted(d.keys()):
+            if isinstance(d[key], int):
+                postfix = int_postfix
+            elif isinstance(d[key], float):
+                postfix = float_postfix
+            else:
+                raise TypeError((key, type(d[key]), d[key]))
+            value_key = "".join(
+                v.capitalize() if v[0] != v[0].capitalize() else v
+                for v in key.replace("_", "-").split("-")
+            )
+            latex_key = f"{k.short_description(latex=True)}{key}{postfix}"
+            latex_values[latex_key] = d[key]
+            if k.EQKE and k.EVOU:
+                summary_latex_values_lists[f"AblateAllImportant{key}"].append(d[key])
+            if k.EQKE or k.EVOU:
+                summary_latex_values_lists[f"AblateAnyImportant{key}"].append(d[key])
+            else:
+                summary_latex_values_lists[f"AblateOnlyNoise{key}"].append(d[key])
+    return latex_values | {
+        k: data_summary(v, float_postfix=float_postfix, int_postfix=int_postfix)
+        for k, v in summary_latex_values_lists.items()
+    }
