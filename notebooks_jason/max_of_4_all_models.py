@@ -11,17 +11,21 @@ if ipython is not None:
 else:
     print("Not in IPython, not loading autoreload")
 # %%
-#!sudo apt-get install dvipng texlive-latex-extra texlive-fonts-recommended cm-super
+#!sudo apt-get install dvipng texlive-latex-extra texlive-fonts-recommended cm-super pdfcrop optipng pngcrush
 # %%
 import traceback
 import gc
+import csv
 from collections import defaultdict
 import random
 import sys
 import os
+import re
+from contextlib import contextmanager
 import time
 import subprocess
 import pandas as pd
+from itertools import chain
 from functools import partial, reduce
 from concurrent.futures import ThreadPoolExecutor
 import math
@@ -37,6 +41,91 @@ from typing import (
     Callable,
 )
 
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.figure
+import seaborn as sns
+import tikzplotly
+import tikzplotlib
+import matplotlib
+from gbmi.analysis_tools.decomp import analyze_svd, split_svd_contributions
+from gbmi.analysis_tools.utils import (
+    pm_round,
+    pm_mean_std,
+    data_summary,
+    data_summary_percentiles,
+)
+from gbmi.analysis_tools.plot import (
+    scatter,
+    colorbar,
+    remove_titles,
+    remove_axis_labels,
+    remove_colorbars,
+    remove_axis_ticklabels,
+)
+from gbmi.exp_max_of_n.verification import LargestWrongLogitQuadraticConfig
+from gbmi.utils.dataclass import enumerate_dataclass_values
+from gbmi.utils.lowrank import LowRankTensor
+import gbmi.utils.ein as ein
+import gbmi.utils.images as image_utils
+from gbmi.utils.images import trim_plotly_figure
+from gbmi.utils.memoshelve import memoshelve
+from gbmi.utils.latex_export import (
+    to_latex_defs,
+    latex_values_of_counter,
+    latex_values_of_instruction_count,
+    format_float_full_precision,
+)
+from gbmi.exp_max_of_n.analysis import (
+    find_second_singular_contributions,
+    find_size_and_query_direction,
+    analyze_EVOU,
+)
+from gbmi.exp_max_of_n.plot import display_basic_interpretation
+from gbmi.exp_max_of_n.train import (
+    IterableDatasetCfg,
+    MaxOfN,
+    MaxOfNDataModule,
+    MaxOfNTrainingWrapper,
+    train_or_load_model,
+)
+from gbmi.model import Config
+import torch
+from tqdm.auto import tqdm
+import numpy as np
+from jaxtyping import Float, Integer
+from torch import Tensor
+import pandas as pd
+import plotly.express as px
+from transformer_lens import HookedTransformerConfig, HookedTransformer
+from pathlib import Path
+from gbmi.utils import default_device, shuffle_tensor
+from gbmi.utils.sequences import (
+    SequenceDataset,
+)
+from gbmi.verification_tools.decomp import (
+    factor_contribution,
+    bound_max_row_diff_by_SVD,
+)
+
+from gbmi.verification_tools.general import EU_PU
+from gbmi.verification_tools.l1h1 import (
+    all_EQKE,
+    all_EQKP,
+    all_EVOU,
+    all_PVOU,
+)
+from gbmi.verification_tools.utils import complexity_of
+from gbmi.utils.hashing import get_hash_ascii
+import gbmi.utils.git as git
+import gbmi.exp_max_of_n.verification.cubic as cubic
+import gbmi.exp_max_of_n.verification.subcubic as subcubic
+import gbmi.exp_max_of_n.verification.quadratic as quadratic
+import gbmi.exp_max_of_n.analysis.quadratic as analysis_quadratic
+import gbmi.exp_max_of_n.analysis.subcubic as analysis_subcubic
+import gbmi.utils.instructions as instructions
 from gbmi.analysis_tools.decomp import analyze_svd, split_svd_contributions
 from gbmi.verification_tools.l1h1 import all_EVOU, all_PVOU
 from gbmi.verification_tools.general import EU_PU
@@ -50,6 +139,8 @@ from gbmi.analysis_tools.plot import (
 from gbmi.exp_max_of_n.plot import (
     EVOU_max_minus_diag_logit_diff,
     attention_difference_over_gap,
+    make_better_slides_plots_00,
+    display_EQKE_SVD_analysis,
 )
 from gbmi.exp_max_of_n.analysis import (
     find_second_singular_contributions,
@@ -79,6 +170,20 @@ from gbmi.utils.latex_export import (
     latex_values_of_counter,
     latex_values_of_instruction_count,
 )
+from gbmi.exp_max_of_n.plot import (
+    scatter_attention_difference_vs_gap,
+    hist_attention_difference_over_gap,
+    hist_EVOU_max_minus_diag_logit_diff,
+)
+from gbmi.analysis_tools.plot import (
+    hist_EVOU_max_logit_diff,
+    weighted_histogram,
+    Colorscale,
+    combine_interpolate_color_mapping,
+    colorscale_to_cmap,
+    imshow,
+    line,
+)
 from gbmi.utils import default_device, dropnan, shuffle_tensors, shuffle_tensor
 from gbmi.utils.gc import PeriodicGarbageCollector
 from gbmi.utils.hashing import get_hash_ascii
@@ -87,7 +192,7 @@ import gbmi.exp_max_of_n.verification.cubic as cubic
 import gbmi.exp_max_of_n.verification.subcubic as subcubic
 import gbmi.exp_max_of_n.analysis.quadratic as analysis_quadratic
 import gbmi.exp_max_of_n.analysis.subcubic as analysis_subcubic
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, Namespace, BooleanOptionalAction
 import gbmi.utils.ein as ein
 import gbmi.utils.instructions as instructions
 from gbmi.utils.instructions import (
@@ -127,6 +232,12 @@ parser.add_argument(
     default=None,
     help="Recompute seeds that appear in csvs",
 )
+parser.add_argument(
+    "--plots",
+    action=BooleanOptionalAction,
+    default=True,
+    help="Include plots",
+)
 cli_args = parser.parse_args(None if ipython is None else ["--ignore-csv"])
 # %%
 cache_dir = Path(__file__).parent / ".cache"
@@ -165,13 +276,71 @@ GIT_SHA_SHORT_PATH = (
 GIT_SHA_SHORT_PATH.parent.mkdir(exist_ok=True, parents=True)
 LATEX_VALUES_PATH = Path(__file__).with_suffix("") / "all-models-values.tex"
 LATEX_VALUES_PATH.parent.mkdir(exist_ok=True, parents=True)
+LATEX_VALUES_DATATABLE_PATH = (
+    Path(__file__).with_suffix("") / "all-models-all-values.csv"
+)
+LATEX_VALUES_DATATABLE_PATH.parent.mkdir(exist_ok=True, parents=True)
+LATEX_FIGURE_PATH = Path(__file__).with_suffix("") / "figures"
+LATEX_FIGURE_PATH.mkdir(exist_ok=True, parents=True)
+LATEX_TIKZPLOTLIB_PREAMBLE_PATH = (
+    Path(__file__).with_suffix("") / "tikzplotlib-preamble.tex"
+)
+LATEX_TIKZPLOTLIB_PREAMBLE_PATH.parent.mkdir(exist_ok=True, parents=True)
 SHARED_CACHE_STEM = Path(__file__).name.replace("_all_models", "")
 N_THREADS: Optional[int] = cli_args.n_threads
+DISPLAY_PLOTS: bool = False  # @param {type:"boolean"}
+SAVE_PLOTS: bool = cli_args.plots
+RENDERER: Optional[str] = "png"  # @param ["png", None]
+PLOT_WITH: Literal["plotly", "matplotlib"] = (  # @param ["plotly", "matplotlib"]
+    "matplotlib"
+)
+matplotlib.rcParams["text.usetex"] = True
+matplotlib.rcParams[
+    "text.latex.preamble"
+] = r"""\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{xfrac}
+\usepackage{lmodern}
+\providecommand{\dmodel}{\ensuremath{d_{\mathrm{model}}}}
+\providecommand{\dhead}{\ensuremath{d_{\mathrm{head}}}}
+\providecommand{\dvocab}{\ensuremath{d_{\mathrm{vocab}}}}
+\providecommand{\barWE}{\ensuremath{\mathbf{\bar{E}}}}
+\providecommand{\qWE}{\ensuremath{\mathbf{E}_q}}
+"""
+default_OV_colorscale_2024_03_26: Colorscale = px.colors.get_colorscale(
+    "RdBu"
+)  # px.colors.get_colorscale("Picnic_r")
+# default_OV_matplotlib_colorscale_2024_03_26: Colorscale = 'bwr_r'
+default_QK_colorscale_2024_03_26: Colorscale = [
+    [0, "#ff0000"],
+    [0.25, "#ff8247"],
+    [0.5, "white"],
+    [0.75, "#ffc100"],
+    [1, "#ff9c05"],
+]
+default_OV_colorscale_2024_06_15: Colorscale = px.colors.get_colorscale("IceFire_r")
+default_QK_colorscale_2024_06_15: Colorscale = px.colors.get_colorscale("IceFire_r")
+# alt: Edge_r, Twilight, twilight_shifted, shift_cyclical_colorscale(px.colors.get_colorscale("Edge"), shift=0)
+oranges = ["#fefec7", "#f29f05", "#f25c05", "#a62f03", "#400d01"]
+blues = ["#e6f3ff", "#5e87f5", "#3d4b91", "#2d2c5e", "#1d0e2c"]
+teals = ["#d1e8e8", "#9AD4DE", "#58B8C9", "#10656d", "#0c3547"]
+default_colorscale_2024_06_16: Colorscale = combine_interpolate_color_mapping(
+    oranges[::-1], blues
+)
+default_OV_colorscale: Colorscale = default_colorscale_2024_06_16
+default_QK_colorscale: Colorscale = default_colorscale_2024_06_16
+default_QK_SVD_colorscale: Colorscale = default_QK_colorscale
 # %%
 if cli_args.no_perf:
     PERF_WORKING = False
 # %%
 latex_values: dict[str, Union[int, float, str]] = {}
+latex_all_values_by_value: dict[str, dict[int, Union[int, float, str]]] = defaultdict(
+    dict
+)
+latex_figures: dict[str, Union[go.Figure, matplotlib.figure.Figure]] = {}
+latex_externalize_tables: dict[str, bool] = {}
+latex_only_externalize_tables: dict[str, bool] = {}
 
 
 # %%
@@ -186,69 +355,6 @@ def maybe_parallel_map(func, *args):
 
 
 # %%
-def data_summary(
-    data, prefix: str = "", float_postfix: str = "Float", int_postfix: str = ""
-):
-    if isinstance(data, dict):
-        keys = list(data.keys())
-        values = [data[k] for k in keys]
-    else:
-        keys = None
-        values = data
-    if isinstance(values, torch.Tensor):
-        values = values.cpu().numpy()
-    elif not isinstance(values, np.ndarray):
-        values = np.array(values)  # turn to float
-
-    wf = lambda k: f"{prefix}{k}{float_postfix}"
-
-    result = {
-        f"{prefix}Len{int_postfix}": len(values.flatten()),
-        wf("Min"): values.min(),
-        wf("Max"): values.max(),
-    }
-    values = values + 0.0  # floatify
-    result |= {
-        wf("Mean"): values.mean(),
-        wf("StdDev"): values.std(),
-        wf("SqrMean"): (values**2).mean(),
-    }
-
-    s = twenty_five_percent_in_std_dev = stats.norm.ppf(0.75) * 2
-    percentiles = stats.norm.cdf([-3 * s, -2 * s, -s, 0, s, 2 * s, 3 * s])
-    percentile_names = [
-        "LowerWhiskerBottomEnd",
-        "LowerWhiskerCrosshatch",
-        "QuartileOne",
-        "Median",
-        "QuartileThree",
-        "UpperWhiskerCrosshatch",
-        "UpperWhiskerTopEnd",
-    ]
-    percentile_values = np.percentile(values, percentiles)
-
-    result.update({wf(pct): v for pct, v in zip(percentile_names, percentile_values)})
-
-    if keys is not None:
-        closest_keys = {}
-
-        def find_closest_key(value):
-            return keys[np.argmin(np.abs(values - value))]
-
-        closest_keys.update(
-            {
-                f"{prefix}MeanKey": find_closest_key(values.mean()),
-                f"{prefix}MinKey": find_closest_key(values.min()),
-                f"{prefix}MaxKey": find_closest_key(values.max()),
-            }
-        )
-
-        for pct, value in zip(percentile_names, percentile_values):
-            closest_keys[f"{prefix}{pct}Key"] = find_closest_key(value)
-
-        result.update(closest_keys)
-
-    return result
 
 
 # %%
@@ -281,6 +387,10 @@ with open(PYTHON_VERSION_PATH, "w") as f:
 
 with open(TORCH_VERSION_PATH, "w") as f:
     f.write(torch.__version__)
+
+
+# %%
+
 # %%
 # hack around newlines of black formatting
 seeds = (
@@ -358,7 +468,7 @@ def update_csv_with_rows(
     new_data: list[dict[str, Union[float, int, str]]],
     *,
     columns: list[str],
-    subset: str = "seed",
+    subset: str | list[str] = "seed",
 ):
     results = None
     if os.path.exists(csv_path):
@@ -379,12 +489,17 @@ def update_csv(
     data: dict[int, dict[str, Union[float, int, str]]],
     columns: list[str],
     *,
-    subset: str = "seed",
+    subset: str | list[str] = "seed",
 ):
     new_data = [data[seed] for seed in sorted(data.keys())]
     update_csv_with_rows(csv_path, new_data, columns=columns, subset=subset)
 
 
+# %%
+latex_values |= {
+    f"{percentile_name}PercentileFloat": percentile_value
+    for percentile_name, percentile_value in zip(*data_summary_percentiles())
+}
 # %% [markdown]
 # # Training stats
 # %%
@@ -480,11 +595,17 @@ update_csv(TRAIN_CSV_PATH, train_data, columns=train_columns)
 
 # %%
 num_seeds = len(train_average_loss)
-avg_train_average_loss = sum(train_average_loss.values()) / num_seeds
-avg_train_average_accuracy = sum(train_average_accuracy.values()) / num_seeds
-std_dev_train_average_loss = float(np.std(list(train_average_loss.values())))
-std_dev_train_average_accuracy = float(np.std(list(train_average_accuracy.values())))
+avg_train_average_loss = sum(sorted(train_average_loss.values())) / num_seeds
+avg_train_average_accuracy = sum(sorted(train_average_accuracy.values())) / num_seeds
+std_dev_train_average_loss = float(np.std(list(sorted(train_average_loss.values()))))
+std_dev_train_average_accuracy = float(
+    np.std(list(sorted(train_average_accuracy.values())))
+)
 latex_values["NumSeeds"] = num_seeds
+assert all(isinstance(seed, int) for seed in train_average_accuracy.keys())
+assert all(isinstance(seed, int) for seed in train_average_loss.keys())
+latex_all_values_by_value["TrainAccuracyFloat"] = train_average_accuracy
+latex_all_values_by_value["TrainLossFloat"] = train_average_loss
 latex_values |= data_summary(train_average_accuracy, prefix="TrainAccuracy")
 latex_values |= data_summary(train_average_loss, prefix="TrainLoss")
 
@@ -674,6 +795,8 @@ for key, latex_key in (
     ("duration", "BruteForceTime"),
 ):
     latex_values |= data_summary(brute_force_data_by_key[key], prefix=latex_key)
+    assert all(isinstance(seed, int) for seed in brute_force_data_by_key[key].keys())
+    latex_all_values_by_value[f"{latex_key}Float"] = brute_force_data_by_key[key]
 
 # %% [markdown]
 # # Cubic proof
@@ -789,6 +912,8 @@ for key, latex_key in (
     ("duration", "CubicProofTime"),
 ):
     latex_values |= data_summary(cubic_data_by_key[key], prefix=latex_key)
+    assert all(isinstance(seed, int) for seed in cubic_data_by_key[key].keys())
+    latex_all_values_by_value[f"{latex_key}Float"] = cubic_data_by_key[key]
 
 
 # %% [markdown]
@@ -798,13 +923,18 @@ max_logit_diffs = {
     seed: EVOU_max_logit_diff(model)
     for seed, (_runtime, model) in runtime_models.items()
 }
-latex_values |= data_summary(
-    {
-        seed: max_logit_diff.mean().item()
-        for seed, max_logit_diff in max_logit_diffs.items()
-    },
-    prefix="EVOUMeanMaxRowDiff",
-)
+max_logit_diff_summaries = {
+    seed: data_summary(max_logit_diff, prefix="EVOUMaxRowDiff", float_postfix="")
+    for seed, max_logit_diff in max_logit_diffs.items()
+}
+max_logit_diff_summaries_by_keys = defaultdict(dict)
+for seed, summary in max_logit_diff_summaries.items():
+    for k, v in summary.items():
+        max_logit_diff_summaries_by_keys[k][seed] = v
+for k, v in max_logit_diff_summaries_by_keys.items():
+    latex_values |= data_summary(v, prefix=k)
+    assert all(isinstance(seed, int) for seed in v.keys())
+    latex_all_values_by_value[f"{k}Float"] = v
 
 # hold some data before summarizing it
 latex_values_tmp_data = defaultdict(dict)
@@ -838,6 +968,13 @@ for seed, (_runtime, model) in runtime_models.items():
         latex_values_tmp_data[value_key + "MostBelowValueSequenceFrac"][
             seed
         ] = frac_below
+        for k, v in data_summary(
+            max_logit_minus_diag,
+            sample_weight=duplication_factors,
+            prefix=value_key,
+            float_postfix="",
+        ).items():
+            latex_values_tmp_data[k][seed] = v
 
     for duplicate_by_sequence_count in [False, True]:
         flat_diffs, duplication_factors = attention_difference_over_gap(
@@ -855,61 +992,18 @@ for seed, (_runtime, model) in runtime_models.items():
         value_key = "".join(
             v.capitalize() if v[0] != v[0].capitalize() else v for v in key.split("-")
         )
-        latex_values_tmp_data[value_key + "Mean"][seed] = mean
-        latex_values_tmp_data[value_key + "Std"][seed] = std
+        for k, v in data_summary(
+            flat_diffs,
+            sample_weight=duplication_factors,
+            prefix=value_key,
+            float_postfix="",
+        ).items():
+            latex_values_tmp_data[k][seed] = v
 
 for k, v in latex_values_tmp_data.items():
     latex_values |= data_summary(v, prefix=k)
-
-
-# %%
-def analyze_EVOU(model: HookedTransformer):
-    EPVOU = all_EVOU(model)
-    PVOU = all_PVOU(model)
-    PVOU_mean = PVOU.mean(dim=0)
-    EPVOU += PVOU_mean
-    PVOU -= PVOU_mean
-    EPU = EU_PU(model)
-    EPVOU_diag = EPVOU.diagonal()
-    EPVOU_centered = EPVOU - EPVOU_diag.unsqueeze(-1)
-    EPVOU_minf_diag = EPVOU_centered.clone()
-    EPVOU_minf_diag[tuple(torch.arange(d) for d in EPVOU.shape)] = -torch.inf
-    EPVOU_max_above_diag = EPVOU_minf_diag.amax(dim=-1)
-    EPVOU_largest_index_above_diag = torch.arange(EPVOU.shape[0])[
-        EPVOU_max_above_diag > 0
-    ]
-    EPVOU_off_diag = EPVOU.clone()
-    EPVOU_off_diag[tuple(torch.arange(d) for d in EPVOU.shape)] = torch.nan
-    EPVOU_off_diag = EPVOU_off_diag[~EPVOU_off_diag.isnan()]
-    EPVOU_centered_off_diag = EPVOU_centered.clone()
-    EPVOU_centered_off_diag[tuple(torch.arange(d) for d in EPVOU_centered.shape)] = (
-        torch.nan
-    )
-    EPVOU_centered_off_diag = EPVOU_centered_off_diag[~EPVOU_centered_off_diag.isnan()]
-
-    result = {}
-    result |= data_summary(EPU.flatten(), "EUPU")
-    result |= data_summary(EPU.abs().flatten(), "EUPUAbs")
-    result |= data_summary(EPU.amax(dim=-1) - EPU.amin(dim=-1), "EUPUMaxRowDiff")
-
-    result |= data_summary(PVOU.flatten(), "PVOU")
-    result |= data_summary(PVOU.abs().flatten(), "PVOUAbs")
-    result |= data_summary(PVOU.amax(dim=-1) - PVOU.amin(dim=-1), "PVOUMaxRowDiff")
-
-    result |= data_summary(EPVOU.flatten(), "EPVOU")
-    result |= data_summary(EPVOU.abs().flatten(), "EPVOUAbs")
-    result |= data_summary(EPVOU.amax(dim=-1) - EPVOU.amin(dim=-1), "EPVOUMaxRowDiff")
-    result |= data_summary(EPVOU_diag, "EPVOUDiagonal")
-    result |= data_summary(EPVOU_centered.flatten(), "EPVOUCentered")
-    result |= data_summary(EPVOU_max_above_diag, "EPVOUMaxAboveDiag")
-    result |= data_summary(
-        EPVOU_largest_index_above_diag, "EPVOUInputsWithCopyingFailure"
-    )
-    result |= data_summary(EPVOU_off_diag, "EPVOUOffDiagonal")
-    result |= data_summary(EPVOU_off_diag.abs(), "EPVOUOffDiagonalAbs")
-    result |= data_summary(EPVOU_centered_off_diag, "EPVOUCenteredOffDiagonal")
-
-    return result
+    assert all(isinstance(seed, int) for seed in v.keys())
+    latex_all_values_by_value[f"{k}Float"] = v
 
 
 # %%
@@ -932,8 +1026,12 @@ for seed, d in EVOU_analyses.items():
 for k, v in EVOU_analyses_by_key.items():
     if k.endswith("Float"):
         latex_values |= data_summary(v, prefix=k[: -len("Float")])
+        assert all(isinstance(seed, int) for seed in v.keys())
+        latex_all_values_by_value[k] = v
     else:
         latex_values |= data_summary(v, prefix=k)
+        assert all(isinstance(seed, int) for seed in v.keys())
+        latex_all_values_by_value[f"{k}Float"] = v
         # vals = set(v.values())
         # assert len(vals) == 1, f"Too many values for {k}: {vals}"
         # latex_values[k] = list(vals)[0]
@@ -943,181 +1041,18 @@ for k, v in EVOU_analyses_by_key.items():
 # %% [markdown]
 # # SVD analysis
 # %%
-# random resampling of EQKE_err
-@torch.no_grad()
-def resample_EQKE_err(
-    *ms: torch.Tensor,
-    # QK_colorscale: Colorscale = "Plasma",
-    # QK_SVD_colorscale: Colorscale = "Picnic_r",
-    seed: int = 1234,
-    nsamples: int = 100,
-) -> dict[str, float]:
-    results_float = {}
-    # what if we randomize the order of all matrices without replacement?
-    torch.manual_seed(seed)
-    results_float["ResampleEQKEErrSeed"] = seed
-    results_float["ResampleEQKEErrNumSamples"] = nsamples
-    row_diffs = []
-    max_row_diffs = []
-    for _ in range(nsamples):
-        ms_no_replacement = [shuffle_tensor(m) for m in ms]
-        result = reduce(torch.matmul, ms_no_replacement)
-        row_diffs.extend(result.max(dim=-1).values - result.min(dim=-1).values)
-        max_row_diffs.append(
-            (result.max(dim=-1).values - result.min(dim=-1).values).max().item()
-        )
-    row_diffs = torch.stack(row_diffs)
-    results_float |= data_summary(max_row_diffs, prefix="ResampleEQKEErr")
-    # print(f"row diff: {pm_mean_std(row_diffs)}")
-    # sampling from normal
-    row_diffs = []
-    max_row_diffs = []
-    for _ in range(nsamples):
-        ms_normal = [torch.randn_like(m) * m.std() + m.mean() for m in ms]
-        result = reduce(torch.matmul, ms_normal)
-        row_diffs.extend(result.max(dim=-1).values - result.min(dim=-1).values)
-        max_row_diffs.append(
-            (result.max(dim=-1).values - result.min(dim=-1).values).max().item()
-        )
-    row_diffs = torch.stack(row_diffs)
-    results_float |= data_summary(max_row_diffs, prefix="ResampleNormalEQKEErr")
-    # print(f"row diff: {pm_mean_std(row_diffs)}")
-    return results_float
 
 
 # %%
-@torch.no_grad()
-def compute_EQKE_SVD_analysis(model: HookedTransformer) -> dict[str, float]:
-    results_float = {}
-    (
-        size_direction,
-        query_direction,
-        size_query_singular_value,
-    ), _ = find_size_and_query_direction(model)
-    (second_key_direction, second_key_singular_value), (
-        second_query_direction,
-        second_query_singular_value,
-    ) = find_second_singular_contributions(model, size_direction, query_direction)
-    (W_Q_U, W_Q_S, W_Q_Vh), (W_Q_contrib, W_Q_err) = split_svd_contributions(
-        model.W_Q[0, 0]
-    )
-    (W_K_U, W_K_S, W_K_Vh), (W_K_contrib, W_K_err) = split_svd_contributions(
-        model.W_K[0, 0]
-    )
-    (
-        (EQKE_query_key, err_accumulator),
-        EQKE_pos_err,
-        (err_upper_bound, (W_E_query_err2, W_Q_err, W_K_errT, W_E_key_err2T)),
-    ) = quadratic.decompose_EQKE_error_quadratic(
-        model,
-        key_direction=size_direction,
-        query_direction=query_direction,
-        second_key_direction=second_key_direction,
-        second_query_direction=second_query_direction,
-        W_Q_U=W_Q_U,
-        W_K_U=W_K_U,
-        sanity_check=False,
-    )
-
-    EQKE_pos_err_with_attn_scale = EQKE_pos_err / model.blocks[0].attn.attn_scale
-
-    for attn_scale, cur_EQKE_pos_err in (
-        ("", EQKE_pos_err),
-        ("WithAttnScale", EQKE_pos_err_with_attn_scale),
-    ):
-        results_float |= data_summary(
-            cur_EQKE_pos_err.flatten(), prefix=f"EQKP{attn_scale}"
-        )
-        results_float |= data_summary(
-            cur_EQKE_pos_err.abs().flatten(), prefix=f"EQKP{attn_scale}Abs"
-        )
-        results_float |= data_summary(
-            cur_EQKE_pos_err.amax(dim=-1) - cur_EQKE_pos_err.amin(dim=-1),
-            prefix=f"EQKP{attn_scale}MaxRowDiff",
-        )
-
-    EQKE_err = W_E_query_err2 @ W_Q_err @ W_K_errT @ W_E_key_err2T
-    EQKE_err_simple = EQKE_err + err_accumulator
-    EQKE_exact = EQKE_query_key + EQKE_err_simple
-
-    EQKE_err_with_attn_scale = EQKE_err / model.blocks[0].attn.attn_scale
-    EQKE_err_simple_with_attn_scale = EQKE_err_simple / model.blocks[0].attn.attn_scale
-    EQKE_exact_with_attn_scale = EQKE_exact / model.blocks[0].attn.attn_scale
-
-    U, S, Vh = torch.linalg.svd(EQKE_exact)
-    S_with_attn_scale = S / model.blocks[0].attn.attn_scale
-    mindim = np.min(model.W_Q[0, 0].shape)
-    for attn_scale, cur_S in (("", S), ("WithAttnScale", S_with_attn_scale)):
-        results_float[f"EQKE{attn_scale}FirstSingularFloat"] = cur_S[0].item()
-        results_float[f"EQKE{attn_scale}SecondSingularFloat"] = cur_S[1].item()
-        results_float[f"EQKE{attn_scale}ThirdSingularFloat"] = cur_S[2].item()
-        results_float[f"EQKE{attn_scale}RatioFirstTwoSingularFloat"] = (
-            cur_S[0] / cur_S[1]
-        ).item()
-        results_float |= data_summary(S[:mindim], prefix=f"EQKE{attn_scale}Singular")
-    size_direction_diffs = size_direction.squeeze()[1:] - size_direction.squeeze()[:-1]
-    results_float |= data_summary(size_direction, prefix="EQKESizeDirection")
-    results_float |= data_summary(size_direction_diffs, prefix="EQKESizeDirectionDiffs")
-    results_float |= data_summary(query_direction, prefix="EQKEQueryDirection")
-
-    for cur_EQKE_err, descr in (
-        (EQKE_err_simple, "Simple"),
-        (EQKE_err, ""),
-        (EQKE_err_simple_with_attn_scale, "SimpleWithAttnScale"),
-        (EQKE_err_with_attn_scale, "WithAttnScale"),
-    ):
-        results_float[f"EQKEErr{descr}MaxRowDiffFloat"] = (
-            (cur_EQKE_err.max(dim=-1).values - cur_EQKE_err.min(dim=-1).values)
-            .max()
-            .item()
-        )
-        results_float[f"EQKEErr{descr}MaxAbsFloat"] = cur_EQKE_err.abs().max().item()
-        results_float[f"EQKEErr{descr}MeanDimZeroNormFloat"] = (
-            cur_EQKE_err.mean(dim=0).norm().item()
-        )
-        results_float |= data_summary(cur_EQKE_err.flatten(), f"EQKEErr{descr}")
-        s1 = torch.linalg.matrix_norm(cur_EQKE_err, ord=2)
-        results_float[f"EQKEErr{descr}FirstSingularFloat"] = s1.item()
-        results_float[f"EQKEErr{descr}FirstSingularSqrtTwoFloat"] = (
-            s1 * np.sqrt(2)
-        ).item()
-        sf1 = torch.linalg.matrix_norm(cur_EQKE_err, ord="fro")
-        results_float[f"EQKEErr{descr}FroNormFloat"] = sf1.item()
-        results_float[f"EQKEErr{descr}FroNormSqrtTwoFloat"] = (sf1 * np.sqrt(2)).item()
-
-    ss = [
-        torch.linalg.matrix_norm(m, ord=2).item()
-        for m in (W_E_query_err2, W_Q_err, W_K_errT, W_E_key_err2T)
-    ]
-    (
-        results_float["WEqqPerpFirstSingularFloat"],
-        results_float["WQqPerpFirstSingularFloat"],
-        results_float["WKkPerpFirstSingularFloat"],
-        results_float["WEkkPerpFirstSingularFloat"],
-    ) = ss
-    results_float["EQKEErrProdFirstSingularFloat"] = np.prod(ss)
-    results_float["EQKEErrProdFirstSingularSqrtTwoFloat"] = np.prod(ss) * np.sqrt(2)
-    sfs = [
-        torch.linalg.matrix_norm(m, ord="fro").item()
-        for m in (W_E_query_err2, W_Q_err, W_K_errT, W_E_key_err2T)
-    ]
-    (
-        results_float["WEqqPerpFroNormFloat"],
-        results_float["WQqPerpFroNormFloat"],
-        results_float["WKkPerpFroNormFloat"],
-        results_float["WEkkPerpFroNormFloat"],
-    ) = sfs
-    results_float["EQKEErrProdFroNormFloat"] = np.prod(sfs)
-    results_float["EQKEErrProdFroNormSqrtTwoFloat"] = np.prod(sfs) * np.sqrt(2)
-
-    results_float |= resample_EQKE_err(W_E_query_err2, W_Q_err, W_K_errT, W_E_key_err2T)
-
-    return results_float
 
 
 # %%
 with memoshelve(
-    (lambda seed: compute_EQKE_SVD_analysis(runtime_models[seed][1])),
+    (
+        lambda seed: display_EQKE_SVD_analysis(
+            runtime_models[seed][1], include_figures=False, show=False, do_print=False
+        )[1]
+    ),
     filename=cache_dir / f"{SHARED_CACHE_STEM}.compute_EQKE_SVD_analysis",
     get_hash_mem=(lambda x: x[0]),
     get_hash=str,
@@ -1135,6 +1070,8 @@ for seed, d in EQKE_SVD_analyses.items():
 for k, v in EQKE_SVD_analyses_by_key.items():
     if k.endswith("Float"):
         latex_values |= data_summary(v, prefix=k[: -len("Float")])
+        assert all(isinstance(seed, int) for seed in v.keys())
+        latex_all_values_by_value[k] = v
     else:
         vals = set(v.values())
         assert len(vals) == 1, f"Too many values for {k}: {vals}"
@@ -1147,6 +1084,8 @@ for seed, d in EQKE_SVD_analyses.items():
 for k, v in EQKE_SVD_analyses_by_key.items():
     if k.endswith("Float"):
         latex_values |= data_summary(v, prefix=k[: -len("Float")])
+        assert all(isinstance(seed, int) for seed in v.keys())
+        latex_all_values_by_value[k] = v
     else:
         vals = set(v.values())
         assert len(vals) == 1, f"Too many values for {k}: {vals}"
@@ -1158,6 +1097,310 @@ update_csv_with_rows(
     columns=["seed"] + list(EQKE_SVD_analyses_by_key.keys()),
     subset=["seed"] + list(EQKE_SVD_analyses_by_key.keys()),
 )
+
+
+# %% [markdown]
+# # Plots
+# %%
+if SAVE_PLOTS or DISPLAY_PLOTS:
+    all_axis_limits = defaultdict(dict)
+    with tqdm(runtime_models.items(), desc="display_basic_interpretation") as pbar:
+        for seed, (_runtime, model) in pbar:
+            pbar.set_postfix(dict(seed=seed))
+            figs, axis_limits = display_basic_interpretation(
+                model,
+                include_uncentered=True,
+                OV_colorscale=default_OV_colorscale,
+                QK_colorscale=default_QK_colorscale,
+                QK_SVD_colorscale=default_QK_SVD_colorscale,
+                tok_dtick=10,
+                plot_with=PLOT_WITH,
+                renderer=RENDERER,
+                show=DISPLAY_PLOTS,
+            )
+            for k, v in axis_limits.items():
+                all_axis_limits[k][seed] = v
+            for attn_scale in ("", "WithAttnScale"):
+                for fig in (
+                    figs[f"EQKE{attn_scale}"],
+                    figs[f"EQKP{attn_scale}"],
+                    figs["EVOU"],
+                    figs["EVOU-centered"],
+                ):
+                    remove_titles(fig)
+                latex_figures[f"{seed}-EQKE{attn_scale}"] = figs[f"EQKE{attn_scale}"]
+                latex_figures[f"{seed}-EQKP{attn_scale}"] = figs[f"EQKP{attn_scale}"]
+                latex_figures[f"{seed}-EQKE{attn_scale}-SVD"] = figs[
+                    f"EQKE{attn_scale} Attention SVD"
+                ]
+                del figs[f"EQKE{attn_scale} Attention SVD"]
+            latex_figures[f"{seed}-EVOU"] = figs["EVOU"]
+            latex_figures[f"{seed}-EVOU-centered"] = figs["EVOU-centered"]
+            PVOU_keys = [
+                k for k in figs.keys() if k.startswith("irrelevant_") and "V" in k
+            ]
+            assert len(PVOU_keys) == 1, f"PVOU_keys: {PVOU_keys}"
+            latex_figures[f"{seed}-PVOU"] = figs[PVOU_keys[0]]
+            del figs[PVOU_keys[0]]
+            EUPU_keys = [k for k in figs.keys() if k.startswith("irrelevant_")]
+            assert len(EUPU_keys) == 1, f"EUPU_keys: {EUPU_keys}"
+            latex_figures[f"{seed}-EUPU"] = figs[EUPU_keys[0]]
+            del figs[EUPU_keys[0]]
+            latex_figures[f"{seed}-PVOU-scatter"] = figs["irrelevant"]
+            del figs["irrelevant"]
+            unused_keys = [k for k in figs if k not in latex_figures]
+            for fig in (
+                latex_figures[f"{seed}-PVOU-scatter"],
+                latex_figures[f"{seed}-EUPU"],
+                latex_figures[f"{seed}-PVOU"],
+            ):
+                remove_titles(fig)
+
+        if unused_keys:
+            print(f"Unused keys: {unused_keys}")
+
+    axis_limits = {}
+    for k, v in all_axis_limits.items():
+        if k.endswith("min"):
+            axis_limits[k] = np.min(list(v.values()))
+        elif k.endswith("max"):
+            axis_limits[k] = np.max(list(v.values()))
+        else:
+            raise ValueError(f"Unknown axis limit key: {k}")
+
+    seen = set()
+    for k in axis_limits.keys():
+        k_no_min_max = (
+            k.replace("zmin", "")
+            .replace("zmax", "")
+            .replace("min", "")
+            .replace("max", "")
+        )
+        latex_key = "".join(
+            [
+                kpart if kpart[:1] == kpart[:1].capitalize() else kpart.capitalize()
+                for kpart in k_no_min_max.replace("-", "_").split("_")
+            ]
+        )
+        k_min = k.replace("max", "min")
+        k_max = k.replace("min", "max")
+        assert k_min in axis_limits, f"Missing {k_min}"
+        assert k_max in axis_limits, f"Missing {k_max}"
+        assert k_min == k or k_max == k, f"Unknown key: {k}"
+        assert k_min != k_max, f"Same key: {k}"
+        if "centered" not in k.lower():
+            v_max = np.max([np.abs(axis_limits[k_min]), np.abs(axis_limits[k_max])])
+            axis_limits[k_min] = -v_max
+            axis_limits[k_max] = v_max
+
+            assert "OV" in k or "QK" in k, f"Unknown key: {k}"
+            if k_no_min_max in seen:
+                continue
+            kwargs = dict(zmin=-v_max, zmax=v_max)
+        else:
+            if k_no_min_max in seen:
+                continue
+            kwargs = dict(zmin=axis_limits[k_min], zmax=axis_limits[k_max])
+        kwargs |= dict(
+            colorscale=(default_OV_colorscale if "OV" in k else default_QK_colorscale),
+            show=False,
+            plot_with=PLOT_WITH,
+            renderer=RENDERER,
+        )
+        figV = colorbar(**kwargs, orientation="vertical")
+        figH = colorbar(**kwargs, orientation="horizontal")
+        seen.add(k_no_min_max)
+        latex_figures[f"Colorbar-{latex_key}-Vertical"] = figV
+        latex_figures[f"Colorbar-{latex_key}-Horizontal"] = figH
+
+    for k, v in axis_limits.items():
+        k = "".join(
+            [
+                kpart if kpart[0] == kpart[0].capitalize() else kpart.capitalize()
+                for kpart in k.replace("-", "_").split("_")
+            ]
+        )
+        latex_values[f"AxisLimits{k}Float"] = v
+
+    with tqdm(
+        runtime_models.items(), desc="display_basic_interpretation (uniform limits)"
+    ) as pbar:
+        for seed, (_runtime, model) in pbar:
+            pbar.set_postfix(dict(seed=seed))
+            figs, _axis_limits = display_basic_interpretation(
+                model,
+                include_uncentered=True,
+                OV_colorscale=default_OV_colorscale,
+                QK_colorscale=default_QK_colorscale,
+                QK_SVD_colorscale=default_QK_SVD_colorscale,
+                tok_dtick=10,
+                **axis_limits,
+                plot_with=PLOT_WITH,
+                renderer=RENDERER,
+                show=DISPLAY_PLOTS,
+            )
+            for attn_scale in ("", "WithAttnScale"):
+                for fig in (
+                    figs[f"EQKE{attn_scale}"],
+                    figs[f"EQKP{attn_scale}"],
+                    figs["EVOU"],
+                    figs["EVOU-centered"],
+                ):
+                    remove_titles(fig)
+                    remove_axis_labels(fig)
+                    remove_colorbars(fig)
+                    remove_axis_ticklabels(fig, remove_tickmarks=True)
+                latex_figures[f"{seed}-EQKE{attn_scale}UniformLimits"] = figs[
+                    f"EQKE{attn_scale}"
+                ]
+                latex_figures[f"{seed}-EQKP{attn_scale}UniformLimits"] = figs[
+                    f"EQKP{attn_scale}"
+                ]
+                del figs[f"EQKE{attn_scale} Attention SVD"]
+            latex_figures[f"{seed}-EVOUUniformLimits"] = figs["EVOU"]
+            latex_figures[f"{seed}-EVOU-centeredUniformLimits"] = figs["EVOU-centered"]
+            PVOU_keys = [
+                k for k in figs.keys() if k.startswith("irrelevant_") and "V" in k
+            ]
+            assert len(PVOU_keys) == 1, f"PVOU_keys: {PVOU_keys}"
+            latex_figures[f"{seed}-PVOUUniformLimits"] = figs[PVOU_keys[0]]
+            del figs[PVOU_keys[0]]
+            EUPU_keys = [k for k in figs.keys() if k.startswith("irrelevant_")]
+            assert len(EUPU_keys) == 1, f"EUPU_keys: {EUPU_keys}"
+            latex_figures[f"{seed}-EUPUUniformLimits"] = figs[EUPU_keys[0]]
+            del figs[EUPU_keys[0]]
+            latex_figures[f"{seed}-PVOU-scatterUniformLimits"] = figs["irrelevant"]
+            del figs["irrelevant"]
+            unused_keys = [k for k in figs if k not in latex_figures]
+            for fig in (
+                latex_figures[f"{seed}-PVOU-scatterUniformLimits"],
+                latex_figures[f"{seed}-EUPUUniformLimits"],
+                latex_figures[f"{seed}-PVOUUniformLimits"],
+            ):
+                remove_titles(fig)
+                remove_axis_labels(fig)
+                remove_colorbars(fig)
+                remove_axis_ticklabels(fig, remove_tickmarks=True)
+
+
+# %%
+## %%
+if DISPLAY_PLOTS or SAVE_PLOTS:
+    with tqdm(runtime_models.items(), desc="make_better_slides_plots_00") as pbar:
+        for seed, (_runtime, model) in pbar:
+            pbar.set_postfix(dict(seed=seed))
+            figs = make_better_slides_plots_00(
+                model,
+                OV_colorscale=default_OV_colorscale,
+                QK_colorscale=default_QK_colorscale,
+                tok_dtick=10,
+                plot_with=PLOT_WITH,
+                renderer=RENDERER,
+                show=DISPLAY_PLOTS,
+                do_print=False,
+            )
+            for k, fig in figs.items():
+                latex_figures[f"{seed}-Decomposition-{k}"] = fig
+# %%
+if DISPLAY_PLOTS or SAVE_PLOTS:
+    with tqdm(runtime_models.items(), desc="hist_EVOU_max_logit_diff") as pbar:
+        for seed, (_runtime, model) in pbar:
+            pbar.set_postfix(dict(seed=seed))
+            latex_figures[f"{seed}-EVOU-hist-max-row-diff"], max_logit_diff = (
+                hist_EVOU_max_logit_diff(
+                    model, plot_with=PLOT_WITH, renderer=RENDERER, show=DISPLAY_PLOTS
+                )
+            )
+            # remove_titles(latex_figures[f"{seed}-EVOU-hist-max-row-diff"])
+            for duplicate_by_sequence_count in [False, True]:
+                key = "EVOU-hist-min-above-diag"
+                if duplicate_by_sequence_count:
+                    key += "-dup-by-seq-count"
+                latex_figures[f"{seed}-{key}"], (
+                    max_logit_minus_diag,
+                    duplication_factors,
+                ) = hist_EVOU_max_minus_diag_logit_diff(
+                    model,
+                    duplicate_by_sequence_count=duplicate_by_sequence_count,
+                    plot_with=PLOT_WITH,
+                    renderer=RENDERER,
+                    show=DISPLAY_PLOTS,
+                )
+                # remove_titles(latex_figures[f"{seed}-{key}"])
+
+
+# %%
+if DISPLAY_PLOTS or SAVE_PLOTS:
+    with tqdm(
+        runtime_models.items(), desc="scatter_attention_difference_vs_gap"
+    ) as pbar:
+        for seed, (_runtime, model) in pbar:
+            pbar.set_postfix(dict(seed=seed))
+            latex_figures[f"{seed}-EQKE-scatter-attention-difference-vs-gap"] = (
+                scatter_attention_difference_vs_gap(
+                    model,
+                    renderer=RENDERER,
+                    show=DISPLAY_PLOTS,
+                    plot_with=PLOT_WITH,
+                    # plot_with="plotly",
+                )  # this one is too big to export to TeX
+            )
+            for duplicate_by_sequence_count in [False, True]:
+                fig, (flat_diffs, duplication_factors) = (
+                    hist_attention_difference_over_gap(
+                        model,
+                        duplicate_by_sequence_count=duplicate_by_sequence_count,
+                        plot_with=PLOT_WITH,
+                        renderer=RENDERER,
+                        show=DISPLAY_PLOTS,
+                    )
+                )
+                key = "EQKE-hist-attention-difference-over-gap" + (
+                    "-dup-by-seq-count" if duplicate_by_sequence_count else ""
+                )
+                latex_figures[f"{seed}-{key}"] = fig
+# %%
+if SAVE_PLOTS or DISPLAY_PLOTS:
+    with tqdm(runtime_models.items(), desc="display_EQKE_SVD_analysis") as pbar:
+        for seed, (_runtime, model) in pbar:
+            pbar.set_postfix(dict(seed=seed))
+            figs, values = display_EQKE_SVD_analysis(
+                model,
+                plot_with=PLOT_WITH,
+                QK_colorscale=default_QK_colorscale,
+                QK_SVD_colorscale=default_QK_SVD_colorscale,
+                tok_dtick=10,
+                renderer=RENDERER,
+                include_figures=True,
+                show=DISPLAY_PLOTS,
+                do_print=False,
+            )
+            key_pairs = {}
+            for attn_scale in ("", "WithAttnScale"):
+                cur_key_pairs = {
+                    f"{k}{attn_scale}": f"{k}{attn_scale}"
+                    for k in (
+                        "WKkPerp-svd",
+                        "WQqPerp-svd",
+                        "WEqqPerp-svd",
+                        "WEkkPerp-svd",
+                        "WEqqPerp",
+                        "WQqPerp",
+                        "WKkPerp",
+                        "WEkkPerp",
+                    )
+                } | {
+                    f"EQKE_err{attn_scale}": f"EQKE-err{attn_scale}",
+                    f"EQKE_err_noticks{attn_scale}": f"EQKE-err-noticks{attn_scale}",
+                    f"EQKE_err_simple{attn_scale}": f"EQKE-err-simple{attn_scale}",
+                    f"EQKE_err_simple_noticks{attn_scale}": f"EQKE-err-simple-noticks{attn_scale}",
+                    f"EQKE_err_svd{attn_scale}": f"EQKE-err-svd{attn_scale}",
+                    f"EQKE{attn_scale}1": f"EQKE{attn_scale}1",
+                    f"EQKE{attn_scale}2": f"EQKE{attn_scale}2",
+                }
+                key_pairs |= cur_key_pairs
+                for key, latex_key in cur_key_pairs.items():
+                    latex_figures[f"{seed}-{latex_key}"] = figs[key]
 
 # %% [markdown]
 # # Sub-cubic Proofs
@@ -1282,14 +1525,37 @@ def try_all_proofs_subcubic(
 
     rows = []
 
-    shared_proof_search_duration = 0.0
-    start = time.time()
-    W_EP_direction_kwargs = analysis_quadratic.W_EP_direction_for_tricks_kwargs(model)
-    find_min_gaps_kwargs = analysis_subcubic.find_min_gaps_with_EQKE_kwargs(model)
-    size_and_query_directions_kwargs = analysis_quadratic.find_EKQE_error_directions(
-        model
-    )
-    shared_proof_search_duration += time.time() - start
+    def _shared_proof_search(seed: int):
+        shared_proof_search_duration = 0.0
+        start = time.time()
+        W_EP_direction_kwargs = analysis_quadratic.W_EP_direction_for_tricks_kwargs(
+            model
+        )
+        find_min_gaps_kwargs = analysis_subcubic.find_min_gaps_with_EQKE_kwargs(model)
+        size_and_query_directions_kwargs = (
+            analysis_quadratic.find_EKQE_error_directions(model)
+        )
+        shared_proof_search_duration += time.time() - start
+        return (
+            W_EP_direction_kwargs,
+            find_min_gaps_kwargs,
+            size_and_query_directions_kwargs,
+            shared_proof_search_duration,
+        )
+
+    with memoshelve(
+        _shared_proof_search,
+        # cache={},
+        filename=cache_dir
+        / f"{SHARED_CACHE_STEM}.shared_proof_search-{cfg_hash_for_filename}",
+    )() as shared_proof_search:
+        (
+            W_EP_direction_kwargs,
+            find_min_gaps_kwargs,
+            size_and_query_directions_kwargs,
+            shared_proof_search_duration,
+        ) = shared_proof_search(seed)
+
     with memoshelve(
         (
             lambda cfg: (
@@ -1510,7 +1776,15 @@ def try_all_proofs_subcubic(
                 weights.flatten()[v <= most_below_value].sum() / weights.sum()
             ).item()
 
-            return frac_below, v, most_below_value, mean, std, num_std
+            return (
+                frac_below,
+                v,
+                weights.flatten().detach().cpu(),
+                most_below_value,
+                mean,
+                std,
+                num_std,
+            )
 
         with memoshelve(
             _analyze_gaps,
@@ -1519,7 +1793,9 @@ def try_all_proofs_subcubic(
             get_hash_mem=(lambda x: x[0]),
             get_hash=str,
         )() as analyze_gaps:
-            (frac_below, v, most_below_value, mean, std, num_std) = analyze_gaps(tricks)
+            (frac_below, v, weights, most_below_value, mean, std, num_std) = (
+                analyze_gaps(tricks)
+            )
 
         row = {
             "seed": seed,
@@ -1661,7 +1937,7 @@ def subcubic_group(tricks: LargestWrongLogitQuadraticConfig):
         "DirectQuadratic"
         if tricks.EUPU_handling_quadratic
         else (
-            "DirectModelSquaredVocab"
+            "DirectVocabModelSquared"
             if tricks.EUPU_handling_subcubic_no_quadratic_vocab
             else None if tricks.EUPU_handling_subcubic else "DirectCubic"
         )
@@ -1671,7 +1947,7 @@ def subcubic_group(tricks: LargestWrongLogitQuadraticConfig):
         if tricks.attention_error_handling_quadratic
         and tricks.attention_handling_quadratic
         else (
-            "AttentionModelSquaredVocab"
+            "AttentionVocabModelSquared"
             if tricks.attention_error_handling_subcubic_no_quadratic_vocab
             and tricks.attention_handling_subcubic_no_quadratic_vocab
             else (
@@ -1704,6 +1980,27 @@ for tricks in all_configs:
     subcubic_leading_complexities[leading_complexity(tricks)].add(tricks_str)
     subcubic_groups[subcubic_group(tricks)].add(tricks_str)
 
+subcubic_key_pairs = [
+    ("accuracy-bound", "Accuracy"),
+    ("duration-proof-search", "ProofSearchTime"),
+    ("duration", "ProofTime"),
+    ("normalized-accuracy-bound", "NormalizedAccuracy"),
+    ("perf-time-enabled-ns", "PerfTimeEnabledNS"),
+    ("perf-instruction-count", "PerfInstructionCount"),
+    ("perf-branch-misses", "PerfBranchMisses"),
+    ("perf-page-faults", "PerfPageFaults"),
+    ("proof-flop-estimate", "InstructionCount"),
+    ("proof-int-op-estimate", "InstructionCountInt"),
+    ("proof-branch-estimate", "InstructionCountBranch"),
+    ("err-upper-bound", "ErrUpperBound"),
+    ("dropped-sequences", "DroppedSequences"),
+    ("dropped-sequences-frac", "DroppedSequencesFrac"),
+    ("most-gap-below-value", "GapMostBelowValue"),
+    ("most-gap-below-value-frac", "GapMostBelowValueSequenceFrac"),
+    ("most-gap-below-value-num-std", "GapMostBelowValueNumStd"),
+    ("max-gap", "MaxGap"),
+    ("effective-dimensionality-estimate", "EffectiveDimensionalityEstimate"),
+]
 
 for trick_filter_descr, trick_filter in (
     [
@@ -1715,7 +2012,7 @@ for trick_filter_descr, trick_filter in (
             ).is_subcubic,
         ),
         (
-            "SubcubicModelSquaredVocab",
+            "SubcubicVocabModelSquared",
             lambda tricks_str: LargestWrongLogitQuadraticConfig.parse(
                 tricks_str, latex=True
             ).is_subcubic_no_quadratic_vocab,
@@ -1743,27 +2040,7 @@ for trick_filter_descr, trick_filter in (
         best_row = max(rows, key=lambda row: row["accuracy-bound"])
         for k, v in best_row.items():
             filtered_subcubic_data_best_by_key[k][seed] = v
-    for key, latex_key in [
-        ("accuracy-bound", "Accuracy"),
-        ("duration-proof-search", "ProofSearchTime"),
-        ("duration", "ProofTime"),
-        ("normalized-accuracy-bound", "NormalizedAccuracy"),
-        ("perf-time-enabled-ns", "PerfTimeEnabledNS"),
-        ("perf-instruction-count", "PerfInstructionCount"),
-        ("perf-branch-misses", "PerfBranchMisses"),
-        ("perf-page-faults", "PerfPageFaults"),
-        ("proof-flop-estimate", "InstructionCount"),
-        ("proof-int-op-estimate", "InstructionCountInt"),
-        ("proof-branch-estimate", "InstructionCountBranch"),
-        ("err-upper-bound", "ErrUpperBound"),
-        ("dropped-sequences", "DroppedSequences"),
-        ("dropped-sequences-frac", "DroppedSequencesFrac"),
-        ("most-gap-below-value", "GapMostBelowValue"),
-        ("most-gap-below-value-frac", "GapMostBelowValueSequenceFrac"),
-        ("most-gap-below-value-num-std", "GapMostBelowValueNumStd"),
-        ("max-gap", "MaxGap"),
-        ("effective-dimensionality-estimate", "EffectiveDimensionalityEstimate"),
-    ]:
+    for key, latex_key in subcubic_key_pairs:
         if key not in filtered_subcubic_data_best_by_key:
             print(f"Warning! Missing key {key}")
             continue
@@ -1771,6 +2048,13 @@ for trick_filter_descr, trick_filter in (
             filtered_subcubic_data_best_by_key[key],
             prefix=f"{trick_filter_descr}OnlyBestAccBoundPerSeed{latex_key}",
         )
+        assert all(
+            isinstance(seed, int)
+            for seed in filtered_subcubic_data_best_by_key[key].keys()
+        ), list(filtered_subcubic_data_best_by_key[key].keys())
+        latex_all_values_by_value[
+            f"{trick_filter_descr}OnlyBestAccBoundPerSeed{latex_key}Float"
+        ] = filtered_subcubic_data_best_by_key[key]
         if any(len(rows) > 1 for rows in filtered_subcubic_data.values()):
             latex_values |= data_summary(
                 [row[key] for rows in filtered_subcubic_data.values() for row in rows],
@@ -1781,9 +2065,322 @@ for trick_filter_descr, trick_filter in (
             #     f"Skipping key {key} since values have at most one corresponding configuration"
             # )
             pass
+
+for seed, rows in subcubic_data.items():
+    for row in rows:
+        for key, latex_key in subcubic_key_pairs:
+            if key in row:
+                assert isinstance(seed, int)
+                latex_all_values_by_value[f"{row['tricks']}{latex_key}Float"][seed] = (
+                    row[key]
+                )
+
 # %%
 latex_values["AllModelsHEADSHA"] = git.get_head_sha(short=False)
 latex_values["AllModelsHEADSHASHORT"] = git.get_head_sha(short=True)
 
 with open(LATEX_VALUES_PATH, "w") as f:
     f.write(to_latex_defs(latex_values))
+# %%
+latex_all_values_by_seed: dict[int, dict[str, Union[int, float, str]]] = defaultdict(
+    dict
+)
+for k, d in latex_all_values_by_value.items():
+    for seed, v in d.items():
+        latex_all_values_by_seed[seed][k] = v
+
+with open(LATEX_VALUES_DATATABLE_PATH, "w", newline="") as f:
+    all_keys = sorted(latex_all_values_by_value.keys())
+    writer = csv.DictWriter(
+        f, fieldnames=["seed"] + all_keys, quoting=csv.QUOTE_MINIMAL
+    )
+
+    writer.writeheader()
+
+    for seed in sorted(latex_all_values_by_seed.keys()):
+        row = {"seed": seed} | {
+            k: format_float_full_precision(v) if isinstance(v, float) else v
+            for k, v in latex_all_values_by_seed[seed].items()
+        }
+        writer.writerow(row)
+
+# %%
+# @title export LaTeX code
+with open(LATEX_TIKZPLOTLIB_PREAMBLE_PATH, "w") as f:
+    f.write(
+        re.sub(
+            r"\\documentclass{[^}]*}" + "\n*", "", tikzplotlib.Flavors.latex.preamble()
+        )
+        + r"""
+% for line breaks
+\pgfplotsset{title/.append style={align=center}}
+"""
+    )
+
+# %%
+# @title export LaTeX figures
+title_reps = {
+    "W_E": r"\WE ",
+    r"W_{\text{pos}}": r"\Wpos ",
+    r"W_{\mathrm{pos}}": r"\Wpos ",
+    r"W_Q": r"\WQ ",
+    r"W_K": r"\WK ",
+    r"d_{\text{head}}": r"\dhead ",
+    r"d_{\mathrm{head}}": r"\dhead ",
+    r"W_V": r"\WV ",
+    r"W_O": r"\WO",
+    r"W_U": r"\WU ",
+    r"\text{EQKE}": r"\EPQKE ",
+    r"\mathrm{EQKE}": r"\EPQKE ",
+    r"\text{EQKP}": r"\EPQKP ",
+    r"\mathrm{EQKP}": r"\EPQKP ",
+    r"d_{\mathrm{model}}": r"\dmodel ",
+    r"d_{\mathrm{vocab}}": r"\dvocab ",
+    r"QK^T": r"\WQ\WK^T",
+    r"×": r"\ensuremath{\times}",
+}
+
+
+@contextmanager
+def texify_title(
+    fig: go.Figure, replace_with_macros: bool = True, show: bool = False, renderer=None
+):
+    orig_title = fig.layout.title.text  # type: ignore
+    new_title = None
+    if orig_title is not None and (
+        any(ch in orig_title for ch in "𝔼x̄") or r"$\mathbb{E}$" in orig_title
+    ):
+        print(f"Replacing 𝔼 in {orig_title}...")
+        new_title = (
+            orig_title.replace("𝔼", r"\mathbb{E}")
+            .replace("x̄", r"\overline{x}")
+            .replace("±", r"\pm ")
+            .replace("σ", r"\sigma ")
+            # .replace("½", r"\sfrac{1}{2}")
+        )
+        for word in (
+            "None",
+            "dim",
+            "OV",
+            "EQKE",
+            "EVOU",
+            ".diag",
+            " (weighted by sequence count)",
+            " (excluding diagonal)",
+            "; range",
+            "max",
+            "min",
+            "head",
+        ):
+            new_title = new_title.replace(word, r"\text{%s}" % word)
+        new_title = re.sub(r"<sub>([^<]*)</sub>", r"_{\1}", new_title)
+        new_title = re.sub(r"<sup>([^<]*)</sup>", r"^{\1}", new_title)
+        new_title = new_title.replace("{pos}", r"{\text{pos}}")
+        lines = new_title.split("<br>")
+        if len(lines) > 1 and ":=" not in lines[0]:
+            lines = [r"\text{%s}" % lines[0]] + lines[1:]
+        elif ": " in lines[0]:
+            lines = lines[0].split(": ")
+            lines = [r"\text{%s: }%s" % (lines[0], ": ".join(lines[1:]))]
+        new_title = r"\\".join(lines)
+        new_title = f"${new_title}$"
+        if replace_with_macros:
+            for search, rep in title_reps.items():
+                new_title = new_title.replace(search, rep)
+
+        print(new_title)
+    try:
+        if new_title is not None:
+            fig.update_layout(title_text=new_title)
+            if show:
+                fig.show(renderer)
+        yield fig
+    finally:
+        if new_title is not None:
+            fig.update_layout(title_text=orig_title)
+
+
+@contextmanager
+def texify_matplotlib_title(
+    fig: matplotlib.figure.Figure, show: bool = False, replace_with_macros: bool = True
+):
+    def texify(s: Optional[str]) -> Optional[str]:
+        if s is None:
+            return None
+        orig_s = s
+        s = s.replace("\n", "\\\\\n")
+        if replace_with_macros:
+            for search, rep in title_reps.items():
+                s = s.replace(search, rep)
+        if s != orig_s:
+            return s
+        return None
+
+    orig_suptitle = fig._suptitle.get_text() if fig._suptitle else None
+    orig_titles = [ax.get_title() for ax in fig.axes if fig.axes]
+    orig_xlabels = [ax.get_xlabel() for ax in fig.axes if fig.axes]
+    orig_ylabels = [ax.get_ylabel() for ax in fig.axes if fig.axes]
+    orig_legend_handles_labels = [
+        ax.get_legend_handles_labels() if ax.get_legend() else ([], [])
+        for ax in fig.axes
+    ]
+    new_suptitle = texify(orig_suptitle)
+    new_titles = [texify(t) for t in orig_titles]
+    new_xlabels = [texify(t) for t in orig_xlabels]
+    new_ylabels = [texify(t) for t in orig_ylabels]
+    new_legend_handles_labels = [
+        (handles, [(texify(label) or label) for label in labels])
+        for handles, labels in orig_legend_handles_labels
+    ]
+    try:
+        if new_suptitle is not None:
+            fig.suptitle(new_suptitle)
+        if fig.axes:
+            for (
+                ax,
+                new_title,
+                new_xlabel,
+                new_ylabel,
+                (new_leg_handles, new_leg_labels),
+            ) in zip(
+                fig.axes,
+                new_titles,
+                new_xlabels,
+                new_ylabels,
+                new_legend_handles_labels,
+            ):
+                if new_title is not None:
+                    ax.set_title(new_title)
+                if new_xlabel is not None:
+                    ax.set_xlabel(new_xlabel)
+                if new_ylabel is not None:
+                    ax.set_ylabel(new_ylabel)
+                if new_leg_labels:
+                    ax.legend(new_leg_handles, new_leg_labels)
+        yield fig
+    finally:
+        if new_suptitle is not None:
+            fig.suptitle(orig_suptitle)
+        if fig.axes:
+            for (
+                ax,
+                orig_title,
+                orig_xlabel,
+                orig_ylabel,
+                (orig_leg_handles, orig_leg_labels),
+            ) in zip(
+                fig.axes,
+                orig_titles,
+                orig_xlabels,
+                orig_ylabels,
+                orig_legend_handles_labels,
+            ):
+                if orig_title is not None:
+                    ax.set_title(orig_title)
+                if orig_xlabel is not None:
+                    ax.set_xlabel(orig_xlabel)
+                if orig_ylabel is not None:
+                    ax.set_ylabel(orig_ylabel)
+                if orig_leg_labels:
+                    ax.legend(orig_leg_handles, orig_leg_labels)
+
+
+if SAVE_PLOTS:
+    errs = []
+
+    def wrap_err(f, *args, return_bool: bool = False, **kwargs):
+        try:
+            result = f(*args, **kwargs)
+            return True if return_bool else result
+        except FileNotFoundError as e:
+            print(f"Warning: {e}")
+            errs.append(e)
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: {e}")
+            errs.append(e)
+        except OSError as e:
+            print(f"Warning: {e}")
+            errs.append(e)
+        if return_bool:
+            return False
+
+    for file_path in chain(
+        LATEX_FIGURE_PATH.glob("*.png"), LATEX_FIGURE_PATH.glob("*.dat")
+    ):
+        file_path.unlink()
+        print(f"Deleted: {file_path}")
+    table_row_sep = r"\\" + "\n"
+    for k, fig in latex_figures.items():
+        if isinstance(fig, go.Figure):
+            fig.update_layout(font_family="Computer Modern")  # Use LaTeX fonts
+            unsupported_by_tikzplotly = any(
+                isinstance(trace, go.Heatmap) for trace in fig.data
+            )
+            # if not unsupported_by_tikzplotly:
+            #     p = LATEX_FIGURE_PATH / f"{k}.tex"
+            #     print(f"Saving {p}...")
+            #     p.parent.mkdir(parents=True, exist_ok=True)
+            #     tikzplotly.save(p, fig)
+            with texify_title(fig, replace_with_macros=False) as fig:
+                if True or unsupported_by_tikzplotly:
+                    for ext in (".pdf", ".svg"):
+                        p = LATEX_FIGURE_PATH / f"{k}{ext}"
+                        print(f"Saving {p}...")
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        fig.write_image(p)
+                        if ext == ".pdf":
+                            wrap_err(subprocess.run, ["pdfcrop", p, p], check=True)
+        elif isinstance(fig, matplotlib.figure.Figure):
+            p = LATEX_FIGURE_PATH / f"{k}.tex"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            externalize_this_table = latex_externalize_tables.get(k, True)
+            if externalize_this_table:
+                if not latex_only_externalize_tables.get(k, False):
+                    p = LATEX_FIGURE_PATH / f"{k}ExternalTables.tex"
+                print(f"Saving {p}...")
+                with texify_matplotlib_title(fig) as fig:
+                    tikzplotlib.save(
+                        p,
+                        fig,
+                        externalize_tables=externalize_this_table,
+                        table_row_sep=table_row_sep,
+                    )
+            p = LATEX_FIGURE_PATH / f"{k}.tex"
+            print(f"Saving {p}...")
+            with texify_matplotlib_title(fig, replace_with_macros=True) as fig:
+                tikzplotlib.save(
+                    p, fig, externalize_tables=False, table_row_sep=table_row_sep
+                )
+            for ext in (".pdf", ".svg"):
+                p = LATEX_FIGURE_PATH / f"{k}{ext}"
+                print(f"Saving {p}...")
+                p.parent.mkdir(parents=True, exist_ok=True)
+                fig.savefig(p)
+                if ext == ".pdf":
+                    wrap_err(subprocess.run, ["pdfcrop", p, p], check=True)
+        else:
+            raise TypeError(f"Unsupported figure {fig} of type {type(fig)}")
+
+    # for f in LATEX_FIGURE_PATH.glob("*.png"):
+    #     wrap_err(image_utils.ect, f)
+    #     wrap_err(image_utils.pngcrush, f)
+    #     wrap_err(image_utils.optipng, f)
+
+    opt_success = wrap_err(
+        image_utils.optimize,
+        *LATEX_FIGURE_PATH.glob("*.png"),
+        exhaustive=True,
+        return_bool=True,
+    )
+
+    if not opt_success:
+        for f in LATEX_FIGURE_PATH.glob("*.png"):
+            wrap_err(image_utils.optimize, f, exhaustive=True)
+
+    if errs:
+        print("Errors:")
+        for e in errs:
+            print(e)
+        print(f"Total errors: {len(errs)}")
+    for e in errs:
+        raise e

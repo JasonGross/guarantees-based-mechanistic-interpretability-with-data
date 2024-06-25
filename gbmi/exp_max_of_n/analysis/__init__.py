@@ -13,6 +13,7 @@ import gbmi.analysis_tools
 from gbmi.analysis_tools.decomp import analyze_svd
 import gbmi.utils
 from gbmi.analysis_tools import plot
+from gbmi.analysis_tools.utils import data_summary
 from gbmi.analysis_tools.fit import (
     cubic_func,
     quintic_func,
@@ -24,6 +25,8 @@ from gbmi.analysis_tools.fit import (
 )
 from gbmi.analysis_tools.plot import Colorscale, colorscale_to_cmap, imshow, line
 from gbmi.verification_tools.decomp import factor_contribution
+from gbmi.verification_tools.l1h1 import all_EVOU, all_PVOU
+from gbmi.verification_tools.general import EU_PU
 
 
 @torch.no_grad()
@@ -218,6 +221,7 @@ def display_size_direction_stats(
     colorscale: Colorscale = "Plasma_r",
     dtick: Optional[float | int] = None,
     plot_with: Literal["plotly", "matplotlib"] = "plotly",
+    show: bool = True,
     **kwargs,
 ):
     cmap = colorscale_to_cmap(colorscale)
@@ -251,6 +255,7 @@ def display_size_direction_stats(
         dtick_x=dtick,
         dtick_y=dtick,
         plot_with=plot_with,
+        show=show,
         **kwargs,
     )
     results["Attention"] = fig
@@ -310,9 +315,11 @@ def display_size_direction_stats(
             fig.update_yaxes(title_text="Query Token", row=1, col=1)
             fig.update_yaxes(range=[0, None], row=1, col=2)
             fig.update_yaxes(title_text="Key Token", row=1, col=3)
-            fig.show(renderer)
+            if show:
+                fig.show(renderer)
         case "matplotlib":
             fig, axs = plt.subplots(1, 3, figsize=(20, 5))
+            plt.close()
             # fig.subplots_adjust(hspace=0.5, wspace=0.4)
             # Plot 1: Query-Side SVD Heatmap
             cax1 = axs[0].matshow(
@@ -360,10 +367,13 @@ def display_size_direction_stats(
             # Adjust layout
             fig.tight_layout(pad=3.0)
             fig.suptitle("Attention SVD")
-            plt.show()
+            if show:
+                plt.figure(fig)
+                plt.show()
             fig.suptitle("")
-            plt.figure(fig)
-            plt.show()
+            if show:
+                plt.figure(fig)
+                plt.show()
     results["Attention SVD"] = fig
 
     contribution_diff = None
@@ -377,6 +387,7 @@ def display_size_direction_stats(
             xaxis="Key Token",
             yaxis="Query Token",
             hovertemplate="Query: %{y}<br>Key: %{x}<br>Value: %{z}<extra></extra>",
+            plot_heatmaps=show,
             **kwargs,
         )
 
@@ -412,12 +423,13 @@ def display_size_direction_stats(
                 col=2,
             )
             fig.update_layout(title="Directions in Token Space", showlegend=False)
-            fig.show(renderer)
+            if show:
+                fig.show(renderer)
         case "matplotlib":
             fig, axs = plt.subplots(
                 1, 2, figsize=(12, 6)
             )  # Adjust the figure size as needed
-
+            plt.close()
             # Plot 1: Size
             axs[0].plot(
                 np.arange(size_direction.shape[0]),
@@ -444,11 +456,13 @@ def display_size_direction_stats(
 
             # Set the main title for all subplots
             fig.suptitle("Directions in Token Space", fontsize=16)
-            plt.tight_layout(
+            fig.tight_layout(
                 rect=[0, 0, 1, 0.95]
             )  # Adjust layout to make room for the main title
             # Show plot
-            plt.show()
+            if show:
+                plt.figure(fig)
+                plt.show()
     results["Directions in Token Space"] = fig
 
     # px.line({'size direction': training.to_numpy(size_direction)}, title="size direction in token space").show(renderer)
@@ -458,6 +472,7 @@ def display_size_direction_stats(
             size_direction_resid,
             title="size direction in residual space",
             renderer=renderer,
+            show=show,
         )
         results["Size Direction in Residual Space"] = fig
     if query_direction_resid is not None:
@@ -465,16 +480,23 @@ def display_size_direction_stats(
             query_direction_resid,
             title="query direction in residual space",
             renderer=renderer,
+            show=show,
         )
         results["Query Direction in Residual Space"] = fig
     if size_direction_QK is not None:
         fig = line(
-            size_direction_QK, title="size direction in QK space", renderer=renderer
+            size_direction_QK,
+            title="size direction in QK space",
+            renderer=renderer,
+            show=show,
         )
         results["Size Direction in QK Space"] = fig
     if query_direction_QK is not None:
         fig = line(
-            query_direction_QK, title="query direction in QK space", renderer=renderer
+            query_direction_QK,
+            title="query direction in QK space",
+            renderer=renderer,
+            show=show,
         )
         results["Query Direction in QK Space"] = fig
 
@@ -541,27 +563,31 @@ def display_size_direction_stats(
         ]
 
     size_direction_differences = size_direction[1:] - size_direction[:-1]
-    figs = show_fits(
-        size_direction,
-        name="Size Direction",
-        fit_funcs=(fit_func for fit_func in fit_funcs if fit_func is not sigmoid_func),
-        do_exclusions=do_exclusions,
-        renderer=renderer,
-    )
-    if figs is not None:
-        results.update(figs)
-    figs = show_fits(
-        size_direction_differences,
-        name="Size Direction Δ",
-        reference_lines=reference_lines,
-        fit_funcs=(
-            fit_func for fit_func in delta_fit_funcs if fit_func is not sigmoid_func
-        ),
-        do_exclusions=do_exclusions,
-        renderer=renderer,
-    )
-    if figs is not None:
-        results.update(figs)
+    if show:
+        figs = show_fits(
+            size_direction,
+            name="Size Direction",
+            fit_funcs=(
+                fit_func for fit_func in fit_funcs if fit_func is not sigmoid_func
+            ),
+            do_exclusions=do_exclusions,
+            renderer=renderer,
+            show=show,
+        )
+        if figs is not None:
+            results.update(figs)
+        figs = show_fits(
+            size_direction_differences,
+            name="Size Direction Δ",
+            reference_lines=reference_lines,
+            fit_funcs=(
+                fit_func for fit_func in delta_fit_funcs if fit_func is not sigmoid_func
+            ),
+            do_exclusions=do_exclusions,
+            renderer=renderer,
+        )
+        if figs is not None:
+            results.update(figs)
 
     y_data = size_direction.detach().cpu().numpy()
     x_data = np.linspace(1, len(y_data), len(y_data))
@@ -627,7 +653,8 @@ def display_size_direction_stats(
             plt.tight_layout(
                 rect=(0, 0.03, 1, 0.95)
             )  # To prevent overlap between suptitle and subplots
-            plt.show()
+            if show:
+                plt.show()
     return results
 
 
@@ -707,5 +734,58 @@ def compute_singular_contribution(
                 fig.update_yaxes(title_text=yaxis, row=1, col=col + 1)
             if xaxis is not None:
                 fig.update_xaxes(title_text=xaxis, row=1, col=col + 1)
-    fig.show(renderer)
+        fig.show(renderer)
     return M - contribution, contribution
+
+
+def analyze_EVOU(model: HookedTransformer) -> dict[str, float]:
+    EPVOU = all_EVOU(model)
+    PVOU = all_PVOU(model)
+    PVOU_mean = PVOU.mean(dim=0)
+    EPVOU += PVOU_mean
+    PVOU -= PVOU_mean
+    EPU = EU_PU(model)
+    EPVOU_diag = EPVOU.diagonal()
+    EPVOU_centered = EPVOU - EPVOU_diag.unsqueeze(-1)
+    EPVOU_minf_diag = EPVOU_centered.clone()
+    EPVOU_minf_diag[tuple(torch.arange(d) for d in EPVOU.shape)] = -torch.inf
+    EPVOU_max_above_diag = EPVOU_minf_diag.amax(dim=-1)
+    EPVOU_largest_index_above_diag = torch.arange(EPVOU.shape[0])[
+        EPVOU_max_above_diag > 0
+    ]
+    EPVOU_off_diag = EPVOU.clone()
+    EPVOU_off_diag[tuple(torch.arange(d) for d in EPVOU.shape)] = torch.nan
+    EPVOU_off_diag = EPVOU_off_diag[~EPVOU_off_diag.isnan()]
+    EPVOU_centered_off_diag = EPVOU_centered.clone()
+    EPVOU_centered_off_diag[tuple(torch.arange(d) for d in EPVOU_centered.shape)] = (
+        torch.nan
+    )
+    EPVOU_centered_off_diag = EPVOU_centered_off_diag[~EPVOU_centered_off_diag.isnan()]
+
+    result = {}
+    result |= data_summary(EPU.flatten(), prefix="EUPU")
+    result |= data_summary(EPU.abs().flatten(), prefix="EUPUAbs")
+    result |= data_summary(EPU.amax(dim=-1) - EPU.amin(dim=-1), prefix="EUPUMaxRowDiff")
+
+    result |= data_summary(PVOU.flatten(), prefix="PVOU")
+    result |= data_summary(PVOU.abs().flatten(), prefix="PVOUAbs")
+    result |= data_summary(
+        PVOU.amax(dim=-1) - PVOU.amin(dim=-1), prefix="PVOUMaxRowDiff"
+    )
+
+    result |= data_summary(EPVOU.flatten(), prefix="EPVOU")
+    result |= data_summary(EPVOU.abs().flatten(), prefix="EPVOUAbs")
+    result |= data_summary(
+        EPVOU.amax(dim=-1) - EPVOU.amin(dim=-1), prefix="EPVOUMaxRowDiff"
+    )
+    result |= data_summary(EPVOU_diag, prefix="EPVOUDiagonal")
+    result |= data_summary(EPVOU_centered.flatten(), prefix="EPVOUCentered")
+    result |= data_summary(EPVOU_max_above_diag, prefix="EPVOUMaxAboveDiag")
+    result |= data_summary(
+        EPVOU_largest_index_above_diag, prefix="EPVOUInputsWithCopyingFailure"
+    )
+    result |= data_summary(EPVOU_off_diag, prefix="EPVOUOffDiagonal")
+    result |= data_summary(EPVOU_off_diag.abs(), prefix="EPVOUOffDiagonalAbs")
+    result |= data_summary(EPVOU_centered_off_diag, prefix="EPVOUCenteredOffDiagonal")
+
+    return result

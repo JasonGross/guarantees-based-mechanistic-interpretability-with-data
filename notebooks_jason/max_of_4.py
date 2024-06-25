@@ -11,7 +11,7 @@ if ipython is not None:
 else:
     print("Not in IPython, not loading autoreload")
 # %%
-#!sudo apt-get install dvipng texlive-latex-extra texlive-fonts-recommended cm-super
+#!sudo apt-get install dvipng texlive-latex-extra texlive-fonts-recommended cm-super pdfcrop optipng pngcrush
 # %%
 import traceback
 import sys
@@ -21,52 +21,44 @@ import subprocess
 from itertools import chain
 from functools import reduce, partial, cache
 from concurrent.futures import ThreadPoolExecutor
-from PIL import Image
-import io
-import dataclasses
 import math
-import glob
 from scipy import stats
 from contextlib import contextmanager
-from collections import defaultdict
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.figure
-import seaborn as sns
-import tikzplotly
 import tikzplotlib
 import matplotlib
-from types import NoneType
 from typing import (
-    Callable,
-    ClassVar,
     Literal,
-    Sequence,
     Optional,
     Tuple,
     Union,
     Any,
-    List,
     Iterator,
 )
 from plotly.subplots import make_subplots
 import plotly.graph_objects as go
-
+from cycler import cycler
 from gbmi.exp_max_of_n.plot import (
     scatter_attention_difference_vs_gap,
     hist_attention_difference_over_gap,
     hist_EVOU_max_minus_diag_logit_diff,
+    make_better_slides_plots_00,
+    display_EQKE_SVD_analysis,
 )
 from gbmi.analysis_tools.plot import (
     hist_EVOU_max_logit_diff,
     weighted_histogram,
     Colorscale,
+    combine_interpolate_color_mapping,
     colorscale_to_cmap,
     imshow,
     line,
+    remove_titles,
 )
 from gbmi.analysis_tools.decomp import analyze_svd, split_svd_contributions
-from gbmi.analysis_tools.utils import pm_round, pm_mean_std
+from gbmi.analysis_tools.utils import pm_round, pm_mean_std, data_summary
 from gbmi.analysis_tools.plot import scatter
 from gbmi.exp_max_of_n.verification import LargestWrongLogitQuadraticConfig
 from gbmi.utils.dataclass import enumerate_dataclass_values
@@ -75,6 +67,7 @@ import gbmi.utils.ein as ein
 import gbmi.utils.images as image_utils
 from gbmi.utils.images import trim_plotly_figure
 from gbmi.utils.memoshelve import memoshelve
+from gbmi.exp_max_of_n.analysis.ablation import compute_ablations
 from gbmi.utils.latex_export import (
     to_latex_defs,
     latex_values_of_counter,
@@ -83,39 +76,32 @@ from gbmi.utils.latex_export import (
 from gbmi.exp_max_of_n.analysis import (
     find_second_singular_contributions,
     find_size_and_query_direction,
+    analyze_EVOU,
 )
 from gbmi.exp_max_of_n.plot import display_basic_interpretation
 from gbmi.exp_max_of_n.train import (
-    FullDatasetCfg,
     IterableDatasetCfg,
     MaxOfN,
     MaxOfNDataModule,
     MaxOfNTrainingWrapper,
     train_or_load_model,
 )
-from gbmi.model import Config, RunData
-from torch.utils.data import DataLoader
+from gbmi.model import Config
 import torch
 from tqdm.auto import tqdm
 import numpy as np
-from jaxtyping import Float, Integer, Bool
+from jaxtyping import Float, Integer
 from torch import Tensor
 import pandas as pd
 import plotly.express as px
 from transformer_lens import HookedTransformerConfig, HookedTransformer
 from pathlib import Path
-from gbmi.utils import default_device, dropnan, shuffle_tensors, shuffle_tensor
-from gbmi.utils.memocache import Memoize
+from gbmi.utils import default_device, shuffle_tensor
 from gbmi.utils.sequences import (
     SequenceDataset,
-    ThunkedDataset,
-    generate_all_sequences_for_model,
 )
-import shelve
 from gbmi.verification_tools.decomp import (
     factor_contribution,
-    split_SVD,
-    max_row_diffs_per_dim,
     bound_max_row_diff_by_SVD,
 )
 
@@ -125,7 +111,6 @@ from gbmi.verification_tools.l1h1 import (
     all_EQKP,
     all_EVOU,
     all_PVOU,
-    all_attention_scores,
 )
 from gbmi.verification_tools.utils import complexity_of
 from gbmi.utils.hashing import get_hash_ascii
@@ -191,6 +176,7 @@ SUBCUBIC_CSV_PATH.parent.mkdir(exist_ok=True, parents=True)
 SUBCUBIC_ANALYSIS_CSV_PATH = ALL_MODELS_PATH / "all-models-subcubic-analysis-values.csv"
 SUBCUBIC_ANALYSIS_CSV_PATH.parent.mkdir(exist_ok=True, parents=True)
 N_THREADS: Optional[int] = 2
+default_colors = plt.rcParams["axes.prop_cycle"]
 matplotlib.rcParams["text.usetex"] = True
 matplotlib.rcParams[
     "text.latex.preamble"
@@ -200,7 +186,10 @@ matplotlib.rcParams[
 \usepackage{lmodern}
 \providecommand{\dmodel}{\ensuremath{d_{\mathrm{model}}}}
 \providecommand{\dhead}{\ensuremath{d_{\mathrm{head}}}}
-\providecommand{\dvocab}{\ensuremath{d_{\mathrm{vocab}}}}"""
+\providecommand{\dvocab}{\ensuremath{d_{\mathrm{vocab}}}}
+\providecommand{\barWE}{\ensuremath{\mathbf{\bar{E}}}}
+\providecommand{\qWE}{\ensuremath{\mathbf{E}_q}}
+"""
 default_OV_colorscale_2024_03_26: Colorscale = px.colors.get_colorscale(
     "RdBu"
 )  # px.colors.get_colorscale("Picnic_r")
@@ -212,8 +201,17 @@ default_QK_colorscale_2024_03_26: Colorscale = [
     [0.75, "#ffc100"],
     [1, "#ff9c05"],
 ]
-default_OV_colorscale: Colorscale = default_OV_colorscale_2024_03_26
-default_QK_colorscale: Colorscale = default_QK_colorscale_2024_03_26
+default_OV_colorscale_2024_06_15: Colorscale = px.colors.get_colorscale("IceFire_r")
+default_QK_colorscale_2024_06_15: Colorscale = px.colors.get_colorscale("IceFire_r")
+# alt: Edge_r, Twilight, twilight_shifted, shift_cyclical_colorscale(px.colors.get_colorscale("Edge"), shift=0)
+oranges = ["#fefec7", "#f29f05", "#f25c05", "#a62f03", "#400d01"]
+blues = ["#e6f3ff", "#5e87f5", "#3d4b91", "#2d2c5e", "#1d0e2c"]
+teals = ["#d1e8e8", "#9AD4DE", "#58B8C9", "#10656d", "#0c3547"]
+default_colorscale_2024_06_16: Colorscale = combine_interpolate_color_mapping(
+    oranges[::-1], blues
+)
+default_OV_colorscale: Colorscale = default_colorscale_2024_06_16
+default_QK_colorscale: Colorscale = default_colorscale_2024_06_16
 default_QK_SVD_colorscale: Colorscale = default_QK_colorscale
 # %%
 latex_values: dict[str, Union[int, float, str]] = {}
@@ -223,8 +221,6 @@ latex_only_externalize_tables: dict[str, bool] = {}
 
 
 # %%
-
-
 # %%
 # hack around newlines of black formatting
 seeds = (
@@ -367,8 +363,10 @@ for seedi, seed in enumerate(tqdm(runtime_models.keys(), desc="seed", position=0
 num_seeds = len(train_average_loss)
 avg_train_average_loss = sum(train_average_loss.values()) / num_seeds
 avg_train_average_accuracy = sum(train_average_accuracy.values()) / num_seeds
-std_dev_train_average_loss = float(np.std(list(train_average_loss.values())))
-std_dev_train_average_accuracy = float(np.std(list(train_average_accuracy.values())))
+std_dev_train_average_loss = float(np.std(list(sorted(train_average_loss.values()))))
+std_dev_train_average_accuracy = float(
+    np.std(list(sorted(train_average_accuracy.values())))
+)
 latex_values["NumSeeds"] = num_seeds
 latex_values["AvgTrainAccuracyFloat"] = avg_train_average_accuracy
 latex_values["StdDevTrainAccuracyFloat"] = std_dev_train_average_accuracy
@@ -512,11 +510,11 @@ with memoshelve(
         ((loss, accuracy, size), incorrect_sequences), duration = run_batch_loss_accuracy(i, batch_size)  # type: ignore
         total_duration += duration
         # Accumulate loss and accuracy
-        start = time.time()
+        # start = time.time()
         total_loss += loss * size
         total_accuracy += accuracy * size
         total_samples += size
-        total_duration += time.time() - start
+        # total_duration += time.time() - start
         all_incorrect_sequences.append(incorrect_sequences)
 
 # Calculate average loss and accuracy
@@ -661,6 +659,26 @@ for tok in range(model.cfg.d_vocab_out):
 #                     cur_accuracy and (int(round(accuracy * size)) == size),
 #                     cur_size + size,
 #                 )
+# %%
+with memoshelve(
+    partial(compute_ablations, model),
+    filename=cache_dir
+    / f"{Path(__file__).name}.compute_ablations-{cfg_hash_for_filename}",
+    get_hash=get_hash_ascii,
+    get_hash_mem=str,
+)() as memo_compute_ablations:
+    ablation_results, ablation_time = memo_compute_ablations()
+
+# %%
+for k, d in ablation_results.items():
+    for key in d.keys():
+        value_key = "".join(
+            v.capitalize() if v[0] != v[0].capitalize() else v
+            for v in key.replace("_", "-").split("-")
+        )
+        latex_key = f"{k.short_description(latex=True)}{value_key}Float"
+        latex_values[latex_key] = d[key]
+        print((latex_key, d[key]))
 
 
 # %% [markdown]
@@ -959,7 +977,7 @@ latex_values["CubicOldDroppedSequencesFracFloat"] = cubic_old_dropped_sequences_
 # # Plots
 # %%
 if DISPLAY_PLOTS:
-    figs = display_basic_interpretation(
+    figs, axis_limits = display_basic_interpretation(
         model,
         include_uncentered=True,
         OV_colorscale=default_OV_colorscale,
@@ -969,12 +987,20 @@ if DISPLAY_PLOTS:
         plot_with=PLOT_WITH,
         renderer=RENDERER,
     )
-    latex_figures["EQKE"] = figs["EQKE"]
+    for attn_scale in ("", "WithAttnScale"):
+        for fig in (
+            figs[f"EQKE{attn_scale}"],
+            figs[f"EQKP{attn_scale}"],
+            figs["EVOU"],
+            figs["EVOU-centered"],
+        ):
+            remove_titles(fig)
+        latex_figures[f"EQKE{attn_scale}"] = figs[f"EQKE{attn_scale}"]
+        latex_figures[f"EQKP{attn_scale}"] = figs[f"EQKP{attn_scale}"]
+        latex_figures[f"EQKE{attn_scale}-SVD"] = figs[f"EQKE{attn_scale} Attention SVD"]
+        del figs[f"EQKE{attn_scale} Attention SVD"]
     latex_figures["EVOU"] = figs["EVOU"]
     latex_figures["EVOU-centered"] = figs["EVOU-centered"]
-    latex_figures["EQKP"] = figs["EQKP"]
-    latex_figures["EQKE-SVD"] = figs["EQKE Attention SVD"]
-    del figs["EQKE Attention SVD"]
     PVOU_keys = [k for k in figs.keys() if k.startswith("irrelevant_") and "V" in k]
     assert len(PVOU_keys) == 1, f"PVOU_keys: {PVOU_keys}"
     latex_figures["PVOU"] = figs[PVOU_keys[0]]
@@ -988,6 +1014,12 @@ if DISPLAY_PLOTS:
     unused_keys = [k for k in figs if k not in latex_figures]
     if unused_keys:
         print(f"Unused keys: {unused_keys}")
+    for fig in (
+        latex_figures[f"PVOU-scatter"],
+        latex_figures[f"EUPU"],
+        latex_figures[f"PVOU"],
+    ):
+        remove_titles(fig)
 
 
 # %%
@@ -1083,189 +1115,6 @@ if DISPLAY_PLOTS:
 
 # %%
 # for slides
-@torch.no_grad()
-def make_better_slides_plots_00(
-    model: HookedTransformer,
-    OV_colorscale: Colorscale = "Picnic_r",
-    QK_colorscale: Colorscale = "Plasma",
-    tok_dtick: Optional[int | float] = None,
-    pos_dtick: Optional[int | float] = None,
-    plot_with: Literal["plotly", "matplotlib"] = PLOT_WITH,
-    renderer: Optional[str] = None,
-) -> dict[str, go.Figure]:
-    W_E, W_pos, W_U, W_V, W_O, W_Q, W_K = (
-        model.W_E.cpu(),
-        model.W_pos.cpu(),
-        model.W_U.cpu(),
-        model.W_V[0, 0].cpu(),
-        model.W_O[0, 0].cpu(),
-        model.W_Q[0, 0].cpu(),
-        model.W_K[0, 0].cpu(),
-    )
-    attn_scale = model.blocks[0].attn.attn_scale
-    EPq = W_E + W_pos[-1]
-    EPk = W_E + W_pos.mean(dim=0)
-    Pk = W_pos - W_pos.mean(dim=0)
-    EPU = EPq @ W_U
-    EVOU = EPk @ W_V @ W_O @ W_U
-    EVOU_centered = EVOU - EVOU.diag()[:, None]
-    PVOU = Pk @ W_V @ W_O @ W_U
-    EQKE = EPq @ W_Q @ W_K.T @ EPk.T / attn_scale
-    EQKP = EPq @ W_Q @ W_K.T @ Pk.T / attn_scale
-    OV_zmax = np.max(
-        [EVOU.abs().max().item(), PVOU.abs().max().item(), EPU.abs().max().item()]
-    )
-    QK_zmax = np.max([EQKE.abs().max().item(), EQKP.abs().max().item()])
-    results = {}
-    for key, zmax, colorscale in (
-        ("OV", OV_zmax, OV_colorscale),
-        ("QK", QK_zmax, QK_colorscale),
-    ):
-        match plot_with:
-            case "plotly":
-                results[f"{key}-colorbar"] = fig = go.Figure(
-                    data=go.Heatmap(
-                        z=[[0]],
-                        colorscale=colorscale,
-                        showscale=True,
-                        zmin=-zmax,
-                        zmax=zmax,
-                        zmid=0,
-                        colorbar=dict(x=0),
-                    )
-                )
-                fig.add_trace(
-                    go.Heatmap(
-                        z=[[0]],
-                        colorscale="Picnic_r",
-                        showscale=False,
-                        zmin=-zmax,
-                        zmax=zmax,
-                        zmid=0,
-                    )
-                )
-                fig.update_layout(
-                    width=75,
-                    xaxis_showgrid=False,
-                    yaxis_showgrid=False,
-                    xaxis_zeroline=False,
-                    yaxis_zeroline=False,
-                    xaxis_visible=False,
-                    yaxis_visible=False,
-                    margin=dict(l=0, r=0, b=0, t=0),
-                )
-                fig.show(renderer)
-            case "matplotlib":
-                cmap = colorscale_to_cmap(colorscale)
-                results[f"{key}-colorbar"] = fig = plt.figure(figsize=(0.5, 4))
-                norm = matplotlib.colors.Normalize(vmin=-zmax, vmax=zmax)
-                cbar = fig.colorbar(
-                    cm.ScalarMappable(norm=norm, cmap=cmap),
-                    cax=fig.gca(),
-                    orientation="vertical",
-                )
-                # cbar = matplotlib.colorbar.ColorbarBase(
-                #     plt.gca(), cmap=cmap, norm=norm, orientation="vertical"
-                # )
-                plt.show()
-    to_latex = (
-        lambda s: re.sub(r"([a-zA-Z]*)<sub>([^>]*)</sub>", r"$\1_{\2}$", s)
-        .replace("position j", "position $j$")
-        .replace("key position k", "position $k$")
-    )
-    maybe_to_latex = to_latex if plot_with == "matplotlib" else (lambda x: x)
-    for m, title, colorscale, zmax, labels, dtick_x, dtick_y in (
-        (
-            EPU,
-            "EPU",
-            OV_colorscale,
-            OV_zmax,
-            {"x": "output logit", "y": "query token t<sub>i</sub>"},
-            tok_dtick,
-            tok_dtick,
-        ),
-        (
-            EVOU,
-            "EVOU",
-            OV_colorscale,
-            OV_zmax,
-            {"x": "output logit", "y": "key token t<sub>j</sub>"},
-            tok_dtick,
-            tok_dtick,
-        ),
-        (
-            PVOU,
-            "PVOU",
-            OV_colorscale,
-            OV_zmax,
-            {"x": "output logit", "y": "position j"},
-            tok_dtick,
-            pos_dtick,
-        ),
-        (
-            EQKE,
-            "EQKE",
-            QK_colorscale,
-            QK_zmax,
-            {"x": "key token t<sub>k</sub>", "y": "query token t<sub>q</sub>"},
-            tok_dtick,
-            tok_dtick,
-        ),
-        (
-            EQKP,
-            "EQKP",
-            QK_colorscale,
-            QK_zmax,
-            {"x": "key position k", "y": "query token t<sub>q</sub>"},
-            pos_dtick,
-            tok_dtick,
-        ),
-    ):
-        key = title
-        results[key] = fig = imshow(
-            m,
-            title=title,
-            colorscale=colorscale,
-            zmax=zmax,
-            zmin=-zmax,
-            xaxis=maybe_to_latex(labels["x"]),
-            yaxis=maybe_to_latex(labels["y"]),
-            show=False,
-            renderer=renderer,
-            plot_with=plot_with,
-            dtick_x=dtick_x,
-            dtick_y=dtick_y,
-        )
-        match plot_with:
-            case "plotly":
-                assert isinstance(fig, go.Figure), f"fig: {type(fig)}"
-                fig.show(renderer)
-                # remove title
-                fig.update_layout(title_text="")
-                fig.update(layout_coloraxis_showscale=False)
-                # crop whitespace
-                fig.update_layout(margin=dict(l=0, r=0, b=0, t=0))
-                trim_plotly_figure(fig)
-                fig.show(renderer)
-            case "matplotlib":
-                assert isinstance(fig, plt.Figure), f"fig: {type(fig)}"
-                ax, cbar_ax = fig.axes
-                plt.tight_layout()
-                plt.show()
-                ax.set_title("")
-                assert hasattr(cbar_ax, "_colorbar"), cbar_ax
-                cbar = cbar_ax._colorbar
-                cbar_ax.remove()
-                # fig.colorbar(cbar_ax.collections[0], ax=ax, use_gridspec=False).remove()
-                for c in ax.get_children():
-                    if getattr(c, "colorbar", None) is cbar:
-                        print(f"!! Manually removing colorbar from {c}")
-                        del c.colorbar
-                plt.tight_layout()
-                plt.figure(fig)
-                plt.show()
-
-    return results
 
 
 ## %%
@@ -1450,6 +1299,8 @@ if DISPLAY_PLOTS:
     # for k, fig in figs.items():
     #     latex_figures[f"Decomposition-{k}"] = fig
 
+# %%
+latex_values |= analyze_EVOU(model)
 # %% [markdown]
 # # Back of the envelope math for sub-cubic
 # %%
@@ -1457,7 +1308,9 @@ if DISPLAY_PLOTS:
     latex_figures["EVOU-hist-max-row-diff"], max_logit_diff = hist_EVOU_max_logit_diff(
         model, plot_with=PLOT_WITH, renderer=RENDERER
     )
+    remove_titles(latex_figures["EVOU-hist-max-row-diff"])
     latex_values["EVOUMeanMaxRowDiffFloat"] = max_logit_diff.mean().item()
+    latex_values |= data_summary(max_logit_diff, prefix="EVOUMaxRowDiff")
     for duplicate_by_sequence_count in [False, True]:
         key = "EVOU-hist-min-above-diag"
         if duplicate_by_sequence_count:
@@ -1470,6 +1323,7 @@ if DISPLAY_PLOTS:
                 renderer=RENDERER,
             )
         )
+        remove_titles(latex_figures[key])
         mean = np.average(
             max_logit_minus_diag.numpy(), weights=duplication_factors.numpy()
         )
@@ -1486,9 +1340,18 @@ if DISPLAY_PLOTS:
         value_key = "".join(
             v.capitalize() if v[0] != v[0].capitalize() else v for v in key.split("-")
         )
+        minv, maxv = (
+            max_logit_minus_diag.min().item(),
+            max_logit_minus_diag.max().item(),
+        )
+        # mid, spread = (minv + maxv) / 2, (maxv - minv) / 2
         latex_values[value_key + "MostBelowValue"] = most_below_value
         latex_values[value_key + "MostBelowValueNumStd"] = num_std
         latex_values[value_key + "MostBelowValueSequenceFracFloat"] = frac_below
+        latex_values[value_key + "MeanFloat"] = mean
+        latex_values[value_key + "StdDevFloat"] = std
+        latex_values[value_key + "MinFloat"] = minv
+        latex_values[value_key + "MaxFloat"] = maxv
         print(
             f"{key}: most ({frac_below*100}%) sequences are <= {most_below_value} (based on + {num_std} std)"
         )
@@ -1498,7 +1361,10 @@ if DISPLAY_PLOTS:
 if DISPLAY_PLOTS:
     latex_figures["EQKE-scatter-attention-difference-vs-gap"] = (
         scatter_attention_difference_vs_gap(
-            model, plot_with="plotly", renderer=RENDERER
+            model,
+            renderer=RENDERER,
+            plot_with=PLOT_WITH,
+            # plot_with="plotly",
         )  # this one is too big to export to TeX
     )
     for duplicate_by_sequence_count in [False, True]:
@@ -1511,6 +1377,7 @@ if DISPLAY_PLOTS:
         key = "EQKE-hist-attention-difference-over-gap" + (
             "-dup-by-seq-count" if duplicate_by_sequence_count else ""
         )
+        remove_titles(fig)
         latex_figures[key] = fig
         mean = np.average(flat_diffs.numpy(), weights=duplication_factors.numpy())
         std = np.average(
@@ -1521,7 +1388,10 @@ if DISPLAY_PLOTS:
             v.capitalize() if v[0] != v[0].capitalize() else v for v in key.split("-")
         )
         latex_values[value_key + "MeanFloat"] = mean
-        latex_values[value_key + "StdFloat"] = std
+        latex_values[value_key + "StdDevFloat"] = std
+        minv, maxv = flat_diffs.min().item(), flat_diffs.max().item()
+        latex_values[value_key + "MinFloat"] = minv
+        latex_values[value_key + "MaxFloat"] = maxv
 
 
 # %% [markdown]
@@ -1626,243 +1496,6 @@ if DISPLAY_PLOTS:
 # %% [markdown]
 # # more plots
 # %%
-@torch.no_grad()
-def display_EQKE_SVD_analysis(
-    model: HookedTransformer,
-    *,
-    QK_colorscale: Colorscale = "Plasma",
-    QK_SVD_colorscale: Colorscale = "Picnic_r",
-    tok_dtick: Optional[int | float] = None,
-    pos_dtick: Optional[int | float] = None,
-    plot_with: Literal["plotly", "matplotlib"] = "plotly",
-    renderer: Optional[str] = None,
-) -> Tuple[dict[str, Union[go.Figure, plt.figure.Figure]], dict[str, float]]:
-    title_kind = "html" if plot_with == "plotly" else "latex"
-    results = {}
-    results_float = {}
-    (
-        size_direction,
-        query_direction,
-        size_query_singular_value,
-    ), _ = find_size_and_query_direction(model)
-    (second_key_direction, second_key_singular_value), (
-        second_query_direction,
-        second_query_singular_value,
-    ) = find_second_singular_contributions(model, size_direction, query_direction)
-    (W_Q_U, W_Q_S, W_Q_Vh), (W_Q_contrib, W_Q_err) = split_svd_contributions(
-        model.W_Q[0, 0]
-    )
-    (W_K_U, W_K_S, W_K_Vh), (W_K_contrib, W_K_err) = split_svd_contributions(
-        model.W_K[0, 0]
-    )
-    (
-        (EQKE_query_key, err_accumulator),
-        EQKE_pos_err,
-        (err_upper_bound, (W_E_query_err2, W_Q_err, W_K_errT, W_E_key_err2T)),
-    ) = quadratic.decompose_EQKE_error_quadratic(
-        model,
-        key_direction=size_direction,
-        query_direction=query_direction,
-        second_key_direction=second_key_direction,
-        second_query_direction=second_query_direction,
-        W_Q_U=W_Q_U,
-        W_K_U=W_K_U,
-        sanity_check=True,
-    )
-    EQKE_exact = (
-        EQKE_query_key
-        + err_accumulator
-        + W_E_query_err2 @ W_Q_err @ W_K_errT @ W_E_key_err2T
-    )
-    U, S, Vh = torch.linalg.svd(EQKE_exact)
-    results_float["EQKEFirstSingularFloat"] = S[0].item()
-    results_float["EQKESecondSingularFloat"] = S[1].item()
-    results_float["EQKEThirdSingularFloat"] = S[2].item()
-    results_float["EQKERatioFirstTwoSingularFloat"] = (S[0] / S[1]).item()
-
-    fig = imshow(
-        EQKE_exact,
-        colorscale=QK_colorscale,
-        title="EQKE",
-        xaxis="key token",
-        yaxis="query token",
-        dtick_x=tok_dtick,
-        dtick_y=tok_dtick,
-        plot_with=plot_with,
-        renderer=renderer,
-    )
-    results["EQKE"] = fig
-    fig = imshow(
-        EQKE_query_key.numpy(),
-        title="EQKE<sub>1</sub>" if title_kind == "html" else "EQKE$_1$",
-        colorscale=QK_colorscale,
-        dtick_x=tok_dtick,
-        dtick_y=tok_dtick,
-        plot_with=plot_with,
-        renderer=renderer,
-    )
-    results["EQKE1"] = fig
-    fig = imshow(
-        err_accumulator.numpy(),
-        title="err_accumulator" if title_kind == "html" else r"err\_accumulator",
-        colorscale=QK_colorscale,
-        dtick_x=tok_dtick,
-        dtick_y=tok_dtick,
-        plot_with=plot_with,
-        renderer=renderer,
-    )
-    results["err_accumulator"] = fig
-    fig = imshow(
-        (EQKE_query_key + err_accumulator),
-        title="EQKE<sub>2</sub>" if title_kind == "html" else "EQKE$_2$",
-        colorscale=QK_colorscale,
-        dtick_x=tok_dtick,
-        dtick_y=tok_dtick,
-        plot_with=plot_with,
-        renderer=renderer,
-    )
-    results["EQKE2"] = fig
-    smath = "" if title_kind == "html" else "$"
-    sWE = "W<sub>E</sub>" if title_kind == "html" else "W_E"
-    sWpos = "W<sub>pos</sub>" if title_kind == "html" else r"W_{\mathrm{pos}}"
-    sWQ = "W<sub>Q</sub>" if title_kind == "html" else r"W_Q"
-    sWK = "W<sub>K</sub>" if title_kind == "html" else r"W_K"
-    sT = "<sup>T</sup>" if title_kind == "html" else "^T"
-    sE = "𝔼" if title_kind == "html" else r"\mathbb{E}"
-    s_p = "<sub>p</sub>" if title_kind == "html" else "_p"
-    fig = imshow(
-        EQKE_pos_err.numpy(),
-        title=f"{smath}({sWE} + {sWpos}[-1]){sWQ}{sWK}{sT}({sWpos} - {sE}{s_p}{sWpos}[p]){sT}{smath}",
-        colorscale=QK_colorscale,
-        dtick_x=pos_dtick,
-        dtick_y=tok_dtick,
-        plot_with=plot_with,
-        renderer=renderer,
-    )
-    results["EQKE_pos_err"] = fig
-    EQKE_err = W_E_query_err2 @ W_Q_err @ W_K_errT @ W_E_key_err2T
-    results_float["EQKEErrMaxRowDiffFloat"] = (
-        (EQKE_err.max(dim=-1).values - EQKE_err.min(dim=-1).values).max().item()
-    )
-    results_float["EQKEErrMaxAbsFloat"] = EQKE_err.abs().max().item()
-    results_float["EQKEErrMeanDimZeroNormFloat"] = EQKE_err.mean(dim=0).norm().item()
-    for k in (
-        "EQKEErrMaxRowDiffFloat",
-        "EQKEErrMaxAbsFloat",
-        "EQKEErrMeanDimZeroNormFloat",
-    ):
-        print(f"{k}: {results_float[k]}")
-    zmax = EQKE_err.abs().max().item()
-    fig = imshow(
-        EQKE_err.numpy(),
-        title="EQKE_err" if title_kind == "html" else r"EQKE\_err",
-        xaxis="key token",
-        yaxis="query token",
-        colorscale=QK_colorscale,
-        zmax=zmax,
-        zmin=-zmax,
-        dtick_x=tok_dtick,
-        dtick_y=tok_dtick,
-        plot_with=plot_with,
-        renderer=renderer,
-    )
-    results["EQKE_err"] = fig
-    fig = imshow(
-        EQKE_err.numpy(),
-        title="EQKE_err" if title_kind == "html" else r"EQKE\_err",
-        xaxis="",
-        yaxis="",
-        colorscale=QK_colorscale,
-        zmax=zmax,
-        zmin=-zmax,
-        showticklabels=False,
-        plot_with=plot_with,
-        renderer=renderer,
-    )
-    results["EQKE_err_noticks"] = fig
-    results["EQKE_err_svd"] = analyze_svd(
-        (W_E_query_err2 @ W_Q_err @ W_K_errT @ W_E_key_err2T),
-        descr="EQKE_err" if title_kind == "html" else r"EQKE\_err",
-        colorscale=QK_SVD_colorscale,
-        plot_with=plot_with,
-        renderer=renderer,
-    )
-    s1 = torch.linalg.matrix_norm(
-        (W_E_query_err2 @ W_Q_err @ W_K_errT @ W_E_key_err2T), ord=2
-    )
-    results_float["EQKEErrFirstSingularFloat"] = s1.item()
-    results_float["EQKEErrFirstSingularSqrtTwoFloat"] = (s1 * np.sqrt(2)).item()
-    print(f"σ₁(EQKE_err)√2 = {s1}√2 = {s1*np.sqrt(2)}")
-    ss = [
-        torch.linalg.matrix_norm(m, ord=2).item()
-        for m in (W_E_query_err2, W_Q_err, W_K_errT, W_E_key_err2T)
-    ]
-    (
-        results_float["WEqqPerpFirstSingularFloat"],
-        results_float["WQqPerpFirstSingularFloat"],
-        results_float["WKkPerpFirstSingularFloat"],
-        results_float["WEkkPerpFirstSingularFloat"],
-    ) = ss
-    print(f"singular values: {ss}")
-    print(f"√2∏σ₁ = {np.prod(ss)}√2 = {np.prod(ss)*np.sqrt(2)}")
-    results_float["EQKEErrProdFirstSingularFloat"] = np.prod(ss)
-    results_float["EQKEErrProdFirstSingularSqrtTwoFloat"] = np.prod(ss) * np.sqrt(2)
-    for m, s, key in (
-        (
-            W_E_query_err2,
-            {"html": "E<sub>q,2</sub><sup>⟂</sup>", "latex": r"$E_{q,2}^{\perp}$"},
-            "WEqqPerp",
-        ),
-        (W_Q_err, {"html": "Q<sup>⟂</sup>", "latex": r"$Q^{\perp}$"}, "WQqPerp"),
-        (W_K_errT, {"html": "K<sup>⟂</sup>", "latex": r"$K^{\perp}$"}, "WKkPerp"),
-        (
-            W_E_key_err2T,
-            {"html": "E<sub>k,2</sub><sup>⟂</sup>", "latex": r"$E_{k,2}^{\perp}$"},
-            "WEkkPerp",
-        ),
-    ):
-        fig = imshow(
-            m.numpy(),
-            title=s[title_kind],
-            colorscale=QK_colorscale,
-            zmax=zmax,
-            zmin=-zmax,
-            showticklabels=False,
-            plot_with=plot_with,
-            renderer=renderer,
-        )
-        results[key] = fig
-        fig = analyze_svd(
-            m,
-            scale_by_singular_value=False,
-            descr=s[title_kind],
-            colorscale=QK_SVD_colorscale,
-            plot_with=plot_with,
-            renderer=renderer,
-        )
-        results[key + "-svd"] = fig
-    sf1 = torch.linalg.matrix_norm(EQKE_err, ord="fro")
-    results_float["EQKEErrFroNormFloat"] = sf1.item()
-    results_float["EQKEErrFroNormSqrtTwoFloat"] = (sf1 * np.sqrt(2)).item()
-    print(f"σf₁(EQKE_err)√2 = {sf1}√2 = {sf1*np.sqrt(2)}")
-    sfs = [
-        torch.linalg.matrix_norm(m, ord="fro").item()
-        for m in (W_E_query_err2, W_Q_err, W_K_errT, W_E_key_err2T)
-    ]
-    (
-        results_float["WEqqPerpFroNormFloat"],
-        results_float["WQqPerpFroNormFloat"],
-        results_float["WKkPerpFroNormFloat"],
-        results_float["WEkkPerpFroNormFloat"],
-    ) = sfs
-    print(f"singular fro values: {sfs}")
-    print(f"√2∏σf₁ = {np.prod(sfs)}√2 = {np.prod(sfs)*np.sqrt(2)}")
-    results_float["EQKEErrProdFroNormFloat"] = np.prod(sfs)
-    results_float["EQKEErrProdFroNormSqrtTwoFloat"] = np.prod(sfs) * np.sqrt(2)
-    print(f"err_upper_bound: {err_upper_bound}")
-
-    return results, results_float
-
 
 if DISPLAY_PLOTS:
     figs, values = display_EQKE_SVD_analysis(
@@ -1872,18 +1505,47 @@ if DISPLAY_PLOTS:
         QK_SVD_colorscale=default_QK_SVD_colorscale,
         tok_dtick=10,
         renderer=RENDERER,
+        include_figures=True,
+        show=True,
+        do_print=True,
     )
-    key_pairs = {
-        k: k for k in ("WKkPerp-svd", "WQqPerp-svd", "WEqqPerp-svd", "WEkkPerp-svd")
-    } | {"EQKE_err": "EQKE-err", "EQKE_err_svd": "EQKE-err-svd"}
-    for key, latex_key in key_pairs.items():
-        latex_figures[latex_key] = figs[key]
+    key_pairs = {}
+    for attn_scale in ("", "WithAttnScale"):
+        cur_key_pairs = {
+            f"{k}{attn_scale}": f"{k}{attn_scale}"
+            for k in (
+                "WKkPerp-svd",
+                "WQqPerp-svd",
+                "WEqqPerp-svd",
+                "WEkkPerp-svd",
+                "WEqqPerp",
+                "WQqPerp",
+                "WKkPerp",
+                "WEkkPerp",
+            )
+        } | {
+            f"EQKE_err{attn_scale}": f"EQKE-err{attn_scale}",
+            f"EQKE_err_noticks{attn_scale}": f"EQKE-err-noticks{attn_scale}",
+            f"EQKE_err_simple{attn_scale}": f"EQKE-err-simple{attn_scale}",
+            f"EQKE_err_simple_noticks{attn_scale}": f"EQKE-err-simple-noticks{attn_scale}",
+            f"EQKE_err_svd{attn_scale}": f"EQKE-err-svd{attn_scale}",
+            f"EQKE{attn_scale}1": f"EQKE{attn_scale}1",
+            f"EQKE{attn_scale}2": f"EQKE{attn_scale}2",
+        }
+        key_pairs |= cur_key_pairs
+        for key, latex_key in cur_key_pairs.items():
+            if key == f"EQKE_err{attn_scale}":
+                remove_titles(figs[key])
+            latex_figures[latex_key] = figs[key]
     latex_values.update(values)
     display_EQKE_SVD_analysis(
         model,
         renderer=RENDERER,
         QK_colorscale=default_QK_colorscale_2024_03_26,
         QK_SVD_colorscale=default_QK_colorscale_2024_03_26,
+        include_figures=True,
+        show=True,
+        do_print=True,
     )
     print(
         f"Unused figure keys: {[k for k in figs.keys() if k not in key_pairs and k not in latex_figures]}"
@@ -1969,126 +1631,31 @@ if DISPLAY_PLOTS:
 
 # %%
 # random resampling of EQKE_err
-@torch.no_grad()
-def resample_EQKE_err(
-    *ms: Tuple[torch.Tensor, Tuple[dict[Literal["html", "latex"], str], str]],
-    # QK_colorscale: Colorscale = "Plasma",
-    # QK_SVD_colorscale: Colorscale = "Picnic_r",
-    seed: int = 1234,
-    nsamples: int = 100,
-    plot_with: Literal["plotly", "matplotlib"] = "plotly",
-    renderer: Optional[str] = None,
-) -> Tuple[dict[str, Union[go.Figure, matplotlib.figure.Figure]], dict[str, float]]:
-    results: dict = {}
-    results_float = {}
-    EQKE_err_exact = reduce(torch.matmul, [m for m, s in ms])
-    for m, (title, fig_key) in ms:
-        m_numpy = m.flatten().numpy()
-        edges = np.histogram_bin_edges(m_numpy, bins="auto")
-        counts, _ = np.histogram(m_numpy, bins=edges)
-        bin_centers = (edges[:-1] + edges[1:]) / 2
-        pdf_values = stats.norm.pdf(
-            bin_centers, loc=m.mean().item(), scale=m.std().item()
-        )
-        pdf_scaled = pdf_values * m.numel() * np.diff(edges)
-        line_name = r"$\mathcal{N}(%s)$" % pm_round(
-            m.mean().item(), m.std().item(), sep=", "
-        )
-        match plot_with:
-            case "plotly":
-                fig = px.histogram(
-                    {"": m_numpy},
-                    nbins=len(edges) - 1,
-                    title=title["html"],
-                    labels={"variable": "", "value": "matrix element value"},
-                )
-                # f"𝒩({pm_round(m.mean().item(), m.std().item(), sep=', ')})"
-                fig.add_scatter(
-                    x=bin_centers,
-                    y=pdf_scaled,
-                    mode="lines",
-                    name=line_name,
-                )
-                fig.show(renderer)
-            case "matplotlib":
-                fig, ax = plt.subplots()
-                ax.hist(
-                    m_numpy,
-                    bins=edges,
-                )
-                ax.plot(
-                    bin_centers, pdf_scaled, linestyle="-", color="r", label=line_name
-                )
-                ax.set_title(title["latex"])
-                ax.set_xlabel("matrix element value")
-                ax.set_ylabel("count")
-                ax.legend()
-                plt.show()
-        results[fig_key] = fig
-    # what if we randomize the order of all matrices without replacement?
-    torch.manual_seed(seed)
-    results_float["ResampleEQKEErrSeed"] = seed
-    results_float["ResampleEQKEErrNumSamples"] = nsamples
-    row_diffs = []
-    max_row_diffs = []
-    for _ in range(nsamples):
-        ms_no_replacement = [shuffle_tensor(m) for m, s in ms]
-        result = reduce(torch.matmul, ms_no_replacement)
-        row_diffs.extend(result.max(dim=-1).values - result.min(dim=-1).values)
-        max_row_diffs.append(
-            (result.max(dim=-1).values - result.min(dim=-1).values).max().item()
-        )
-    row_diffs = torch.stack(row_diffs)
-    max_row_diffs = torch.tensor(max_row_diffs)
-    print(f"max row diff (n = {nsamples}): {pm_mean_std(max_row_diffs)}")
-    results_float["ResampleEQKEErrMeanFloat"] = max_row_diffs.mean().item()
-    results_float["ResampleEQKEErrStdFloat"] = max_row_diffs.std().item()
-    # print(f"row diff: {pm_mean_std(row_diffs)}")
-    # sampling from normal
-    row_diffs = []
-    max_row_diffs = []
-    for _ in range(nsamples):
-        ms_normal = [torch.randn_like(m) * m.std() + m.mean() for m, s in ms]
-        result = reduce(torch.matmul, ms_normal)
-        row_diffs.extend(result.max(dim=-1).values - result.min(dim=-1).values)
-        max_row_diffs.append(
-            (result.max(dim=-1).values - result.min(dim=-1).values).max().item()
-        )
-    row_diffs = torch.stack(row_diffs)
-    max_row_diffs = torch.tensor(max_row_diffs)
-    m_descr = ", ".join(
-        f"𝒩({pm_round(m.mean().item(), m.std().item(), sep=', ')})" for m, s in ms
-    )
-    print(f"max row diff (n = {nsamples}, m ~ {m_descr}): {pm_mean_std(max_row_diffs)}")
-    results_float["ResampleNormalEQKEErrMeanFloat"] = max_row_diffs.mean().item()
-    results_float["ResampleNormalEQKEErrStdFloat"] = max_row_diffs.std().item()
-    # print(f"row diff: {pm_mean_std(row_diffs)}")
-    return results, results_float
 
-
-if DISPLAY_PLOTS:
-    figs, values = resample_EQKE_err(
-        (
-            W_E_query_err2,
-            (
-                {"html": "E<sub>q,2</sub><sup>⟂</sup>", "latex": r"$E_{q,2}^\perp$"},
-                "WEqqPerp-hist",
-            ),
-        ),
-        (W_Q_err, ({"html": "Q<sup>⟂</sup>", "latex": r"$Q^\perp$"}, "WQqPerp-hist")),
-        (W_K_errT, ({"html": "K<sup>⟂</sup>", "latex": r"$K^\perp$"}, "WKkPerp-hist")),
-        (
-            W_E_key_err2T,
-            (
-                {"html": "E<sub>k,2</sub><sup>⟂</sup>", "latex": r"$E_{k,2}^\perp$"},
-                "WEkkPerp-hist",
-            ),
-        ),
-        plot_with=PLOT_WITH,
-        renderer=RENDERER,
-    )
-    latex_figures.update(figs)
-    latex_values.update(values)
+# if DISPLAY_PLOTS:
+#     figs, values = resample_EQKE_err(
+#         (
+#             W_E_query_err2,
+#             (
+#                 {"html": "E<sub>q,2</sub><sup>⟂</sup>", "latex": r"$E_{q,2}^\perp$"},
+#                 "WEqqPerp-hist",
+#             ),
+#         ),
+#         (W_Q_err, ({"html": "Q<sup>⟂</sup>", "latex": r"$Q^\perp$"}, "WQqPerp-hist")),
+#         (W_K_errT, ({"html": "K<sup>⟂</sup>", "latex": r"$K^\perp$"}, "WKkPerp-hist")),
+#         (
+#             W_E_key_err2T,
+#             (
+#                 {"html": "E<sub>k,2</sub><sup>⟂</sup>", "latex": r"$E_{k,2}^\perp$"},
+#                 "WEkkPerp-hist",
+#             ),
+#         ),
+#         plot_with=PLOT_WITH,
+#         renderer=RENDERER,
+#         include_figures=True, show=True, do_print=True,
+#     )
+#     latex_figures.update(figs)
+#     latex_values.update(values)
 
 
 # %%
@@ -2540,10 +2107,10 @@ with torch.no_grad():
             )
         latex_values[err_upper_bound_key] = err_upper_bound_value
 
-        latex_values[f"SubcubicAccuracy{postkey}Float"] = accuracy_bound
-        latex_values[f"SubcubicProofTime{postkey}Float"] = prooftime
-        latex_values[f"SubcubicDroppedSequences{postkey}"] = left_behind
-        latex_values[f"SubcubicDroppedSequencesFrac{postkey}Float"] = (
+        latex_values[f"Subcubic{postkey}AccuracyFloat"] = accuracy_bound
+        latex_values[f"Subcubic{postkey}ProofTimeFloat"] = prooftime
+        latex_values[f"Subcubic{postkey}DroppedSequences"] = left_behind
+        latex_values[f"Subcubic{postkey}DroppedSequencesFracFloat"] = (
             left_behind / total_sequences
         )
 
@@ -2587,12 +2154,12 @@ with torch.no_grad():
             frac_below = (
                 weights.flatten()[v <= most_below_value].sum() / weights.sum()
             ).item()
-            latex_values[f"SubcubicGapMostBelowValue{postlatexkey}"] = most_below_value
-            latex_values[f"SubcubicGapMostBelowValueNumStd{postlatexkey}Float"] = (
+            latex_values[f"Subcubic{postlatexkey}GapMostBelowValue"] = most_below_value
+            latex_values[f"Subcubic{postlatexkey}GapMostBelowValueNumStdFloat"] = (
                 num_std
             )
             latex_values[
-                f"SubcubicGapMostBelowValueSequenceFrac{postlatexkey}Float"
+                f"Subcubic{postlatexkey}GapMostBelowValueSequenceFracFloat"
             ] = frac_below
             print(
                 f"{postlatexkey}: most ({frac_below*100}%) sequences are <= {most_below_value} (based on + {num_std} std)"
@@ -2611,7 +2178,7 @@ with torch.no_grad():
                     plot_with=PLOT_WITH,
                     renderer=RENDERER,
                 )
-                latex_figures[f"SubcubicGapHistogram{postkey}"] = fig
+                latex_figures[f"Subcubic{postkey}GapHistogram"] = fig
             except Exception as e:
                 etype, value, tb = sys.exc_info()
                 if value is None:
@@ -2732,7 +2299,7 @@ if HAS_CSVS:
             "almost-quadratic"
             if tricks.is_quadratic
             else (
-                "model-squared-vocab"
+                "vocab-model-squared"
                 if tricks.is_subcubic_no_quadratic_vocab
                 else "subcubic" if tricks.is_subcubic else "fake-cubic"
             )
@@ -2744,7 +2311,7 @@ if HAS_CSVS:
             "direct-quadratic"
             if tricks.EUPU_handling_quadratic
             else (
-                "direct-model-squared-vocab"
+                "direct-vocab-model-squared"
                 if tricks.EUPU_handling_subcubic_no_quadratic_vocab
                 else None if tricks.EUPU_handling_subcubic else "direct-cubic"
             )
@@ -2754,7 +2321,7 @@ if HAS_CSVS:
             if tricks.attention_error_handling_quadratic
             and tricks.attention_handling_quadratic
             else (
-                "attention-model-squared-vocab"
+                "attention-vocab-model-squared"
                 if tricks.attention_error_handling_subcubic_no_quadratic_vocab
                 and tricks.attention_handling_subcubic_no_quadratic_vocab
                 else (
@@ -2834,6 +2401,21 @@ if HAS_CSVS:
     combined_df["frontier"] = combined_df.apply(
         is_frontier, args=(combined_df,), axis=1
     )
+
+
+# %%
+def double_singleton_groups(data: pd.DataFrame, column: str) -> pd.DataFrame:
+    # hack around https://github.com/nschloe/tikzplotlib/issues/594
+    group_counts = data[column].value_counts()
+    single_row_groups = group_counts[group_counts == 1].index
+    for group in single_row_groups:
+        single_row = data[data[column] == group]
+        data = pd.concat([data, single_row], ignore_index=True)
+    return data
+
+
+# %%
+
 # %%
 if HAS_CSVS:
     subcubic_sing_df = subcubic_ext_df.merge(
@@ -2843,7 +2425,7 @@ if HAS_CSVS:
     for trick in tricks:
         if "AttnErrExactEqke" in trick:
             subcubic_sing_df = subcubic_sing_df[subcubic_sing_df["tricks"] != trick]
-    subcubic_sing_df["attention_error_handling"] = subcubic_ext_df.apply(
+    subcubic_sing_df["attention_error_handling"] = subcubic_sing_df.apply(
         (
             lambda row: LargestWrongLogitQuadraticConfig.parse(
                 row["tricks"], latex=True
@@ -2851,7 +2433,7 @@ if HAS_CSVS:
         ),
         axis=1,
     )
-    subcubic_sing_df["attention_handling"] = subcubic_ext_df.apply(
+    subcubic_sing_df["attention_handling"] = subcubic_sing_df.apply(
         (
             lambda row: LargestWrongLogitQuadraticConfig.parse(
                 row["tricks"], latex=True
@@ -2859,7 +2441,7 @@ if HAS_CSVS:
         ),
         axis=1,
     )
-    subcubic_sing_df["EUPU_handling"] = subcubic_ext_df.apply(
+    subcubic_sing_df["EUPU_handling"] = subcubic_sing_df.apply(
         (
             lambda row: LargestWrongLogitQuadraticConfig.parse(
                 row["tricks"], latex=True
@@ -2872,15 +2454,18 @@ if HAS_CSVS:
             "normalized-accuracy-bound"
         ].idxmax()
     ]
-
+    data = subcubic_sing_df[
+        [
+            "normalized-accuracy-bound",
+            "EQKERatioFirstTwoSingularFloat",
+            "attention_error_handling",
+        ]
+    ]
+    data = double_singleton_groups(
+        data.drop_duplicates(), column="attention_error_handling"
+    )
     fig = px.scatter(
-        subcubic_sing_df[
-            [
-                "normalized-accuracy-bound",
-                "EQKERatioFirstTwoSingularFloat",
-                "attention_error_handling",
-            ]
-        ],
+        data,
         y="normalized-accuracy-bound",
         x="EQKERatioFirstTwoSingularFloat",
         color="attention_error_handling",
@@ -2897,15 +2482,17 @@ if HAS_CSVS:
     # Show the plot
     fig.show("png")
 # %%
+# plt.set_prop_cycle(color=['red', 'green', 'blue'])
+# default_colors
+# cycler(color=plt.cm.Paired.colors)
+# cycler(color=plt.cm.tab20c.colors)
+# %%
+plt.rcParams["axes.prop_cycle"] = cycler(color=plt.cm.Paired.colors[::-1])
 if HAS_CSVS:
     subcubic_sing_df = subcubic_ext_df.merge(
         subcubic_analysis_df[["seed", "EQKERatioFirstTwoSingularFloat"]], on="seed"
     )[["seed", "normalized-accuracy-bound", "tricks", "EQKERatioFirstTwoSingularFloat"]]
-    tricks = set(subcubic_sing_df["tricks"])
-    for trick in tricks:
-        if "AttnErrExactEqke" in trick:
-            subcubic_sing_df = subcubic_sing_df[subcubic_sing_df["tricks"] != trick]
-    subcubic_sing_df["attention_error_handling"] = subcubic_ext_df.apply(
+    subcubic_sing_df["attention_error_handling"] = subcubic_sing_df.apply(
         (
             lambda row: LargestWrongLogitQuadraticConfig.parse(
                 row["tricks"], latex=True
@@ -2913,7 +2500,7 @@ if HAS_CSVS:
         ),
         axis=1,
     )
-    subcubic_sing_df["attention_handling"] = subcubic_ext_df.apply(
+    subcubic_sing_df["attention_handling"] = subcubic_sing_df.apply(
         (
             lambda row: LargestWrongLogitQuadraticConfig.parse(
                 row["tricks"], latex=True
@@ -2921,7 +2508,7 @@ if HAS_CSVS:
         ),
         axis=1,
     )
-    subcubic_sing_df["EUPU_handling"] = subcubic_ext_df.apply(
+    subcubic_sing_df["EUPU_handling"] = subcubic_sing_df.apply(
         (
             lambda row: LargestWrongLogitQuadraticConfig.parse(
                 row["tricks"], latex=True
@@ -2929,67 +2516,93 @@ if HAS_CSVS:
         ),
         axis=1,
     )
-    subcubic_sing_df = subcubic_sing_df.loc[
-        subcubic_sing_df.groupby(["seed", "attention_error_handling"])[
+    tricks = set(subcubic_sing_df["tricks"])
+    for trick in tricks:
+        if (
+            "exact_EQKE"
+            in LargestWrongLogitQuadraticConfig.parse(
+                trick, latex=True
+            ).attention_error_handling
+        ):
+            subcubic_sing_df = subcubic_sing_df[subcubic_sing_df["tricks"] != trick]
+
+    # subcubic_sing_df = subcubic_sing_df.loc[
+    #     subcubic_sing_df.groupby(["seed", "attention_error_handling"])[
+    #         "normalized-accuracy-bound"
+    #     ].idxmax()
+    # ]
+
+    for best_bound_only in (True, False):
+        df = subcubic_sing_df.copy()
+        if best_bound_only:
+            print(f"len before: {len(df)}")
+            df = df.loc[
+                df.groupby(["seed", "attention_error_handling"])[
+                    "normalized-accuracy-bound"
+                ].idxmax()
+            ]
+            print(f"len after: {len(df)}")
+
+        # Group by 'attention_error_handling' and calculate the max 'normalized-accuracy-bound' for sorting groups
+        df = df[
+            [
+                "normalized-accuracy-bound",
+                "EQKERatioFirstTwoSingularFloat",
+                "attention_error_handling",
+            ]
+        ].sort_values(
+            by=[
+                "attention_error_handling",
+                "normalized-accuracy-bound",
+                "EQKERatioFirstTwoSingularFloat",
+            ]
+        )
+        # Group by 'attention_error_handling' and calculate the max 'normalized-accuracy-bound' for each group
+        max_bound_by_group = df.groupby("attention_error_handling")[
             "normalized-accuracy-bound"
-        ].idxmax()
-    ]
+        ].max()
 
-    # Group by 'attention_error_handling' and calculate the max 'normalized-accuracy-bound' for sorting groups
-    df = subcubic_sing_df[
-        [
-            "normalized-accuracy-bound",
-            "EQKERatioFirstTwoSingularFloat",
-            "attention_error_handling",
-        ]
-    ].sort_values(
-        by=[
-            "attention_error_handling",
-            "normalized-accuracy-bound",
-            "EQKERatioFirstTwoSingularFloat",
-        ]
-    )
-    # Group by 'attention_error_handling' and calculate the max 'normalized-accuracy-bound' for each group
-    max_bound_by_group = df.groupby("attention_error_handling")[
-        "normalized-accuracy-bound"
-    ].max()
+        # Sort the groups by max 'normalized-accuracy-bound'
+        sorted_groups = max_bound_by_group.sort_values(ascending=False)
 
-    # Sort the groups by max 'normalized-accuracy-bound'
-    sorted_groups = max_bound_by_group.sort_values(ascending=False)
+        # Extract the sorted list of 'attention_error_handling' categories
+        sorted_attn_err_handling = sorted_groups.index.tolist()
 
-    # Extract the sorted list of 'attention_error_handling' categories
-    sorted_attn_err_handling = sorted_groups.index.tolist()
-
-    latex_externalize_tables["NormalizedAccuracyBoundVsEPQKESingularRatio"] = True
-    latex_figures["NormalizedAccuracyBoundVsEPQKESingularRatio"] = fig = scatter(
-        df,
-        yrange=(0, 1),
-        y="normalized-accuracy-bound",
-        x="EQKERatioFirstTwoSingularFloat",
-        color="attention_error_handling",
-        # title='Normalized Accuracy Bound vs EQKE Ratio First Two Singular',
-        yaxis="Normalized Accuracy Bound",
-        xaxis=r"EPQKE Singular Ratio: $\sigma_1 / \sigma_2$",
-        # labels={
-        #     'normalized-accuracy-bound': 'Normalized Accuracy Bound',
-        #     'EQKERatioFirstTwoSingularFloat': 'EQKE Ratio First Two Singular'
-        # }
-        color_order=sorted_attn_err_handling,
-        renderer=RENDERER,
-        plot_with=PLOT_WITH,
-    )
-    # fig.update_layout(showlegend=False)
-    # fig.update_layout(
-    #     legend=dict(
-    #         orientation="h",
-    #         yanchor="top",
-    #         y=-0.3,
-    #         xanchor="center",
-    #         x=0.5
-    #     )
-    # )
-    # # Show the plot
-    # fig.show('png')
+        key = f"NormalizedAccuracyBound{'AllSecondaryTricks' if not best_bound_only else ''}VsEPQKESingularRatio"
+        latex_externalize_tables[key] = True
+        df = double_singleton_groups(
+            df.drop_duplicates(), column="attention_error_handling"
+        )
+        latex_figures[key] = fig = scatter(
+            df,
+            yrange=(0, 1),
+            y="normalized-accuracy-bound",
+            x="EQKERatioFirstTwoSingularFloat",
+            color="attention_error_handling",
+            # title='Normalized Accuracy Bound vs EQKE Ratio First Two Singular',
+            yaxis="Normalized Accuracy Bound",
+            xaxis=r"EPQKE Singular Ratio: $\sigma_1 / \sigma_2$",
+            # labels={
+            #     'normalized-accuracy-bound': 'Normalized Accuracy Bound',
+            #     'EQKERatioFirstTwoSingularFloat': 'EQKE Ratio First Two Singular'
+            # }
+            color_order=sorted_attn_err_handling,
+            renderer=RENDERER,
+            plot_with=PLOT_WITH,
+            # plot_with="plotly"
+        )
+        # fig.update_layout(showlegend=False)
+        # fig.update_layout(
+        #     legend=dict(
+        #         orientation="h",
+        #         yanchor="top",
+        #         y=-0.3,
+        #         xanchor="center",
+        #         x=0.5
+        #     )
+        # )
+        # # Show the plot
+        # fig.show()
 
 
 # %%
@@ -3028,6 +2641,10 @@ if HAS_CSVS:
         "brute-force": f"brute force (acc: {pm_mean_std(brute_force_df['accuracy'])})",
         "cubic": f"cubic (rel acc: {pm_mean_std(cubic_ext_df['normalized-accuracy-bound'])})",
     }
+    category_name_remap_short = {
+        "brute-force": f"brute force",
+        "cubic": f"cubic",
+    }
     max_rows = subcubic_ext_df.loc[
         subcubic_ext_df.groupby(["seed", "group"])["normalized-accuracy-bound"].idxmax()
     ]
@@ -3042,26 +2659,17 @@ if HAS_CSVS:
             new_group_name = group_name[len("subcubic (") : -1]
             new_group_name = "subcubic" if not new_group_name else new_group_name
             new_group_name = new_group_name.replace(
-                "model-squared-vocab", r"$d_{\mathrm{model}}^2d_{\mathrm{vocab}}$"
+                "vocab-model-squared", r"$d_{\mathrm{vocab}}d_{\mathrm{model}}^2$"
             )
             category_name_remap[group_name] = (
                 f"{new_group_name} (rel acc: {pm_round(avg, std)})"
             )
-
-
-# %%
-def double_singleton_groups(data: pd.DataFrame, column: str) -> pd.DataFrame:
-    # hack around https://github.com/nschloe/tikzplotlib/issues/594
-    group_counts = data[column].value_counts()
-    single_row_groups = group_counts[group_counts == 1].index
-    for group in single_row_groups:
-        single_row = data[data[column] == group]
-        data = pd.concat([data, single_row], ignore_index=True)
-    return data
+            category_name_remap_short[group_name] = new_group_name
 
 
 # PLOT_WITH = "matplotlib"
 # %%
+plt.rcParams["axes.prop_cycle"] = cycler(color=plt.cm.Paired.colors)
 if HAS_CSVS:
     latex_externalize_tables["EffectiveDimensionVsFLOP"] = True
     data = combined_df[
@@ -3071,7 +2679,7 @@ if HAS_CSVS:
     data = data.sort_values(
         by=["group", "proof-flop-estimate", "effective-dimension-estimate"]
     )
-    data["group"] = data["group"].map(category_name_remap)
+    data["group"] = data["group"].map(category_name_remap_short)
     latex_externalize_tables["EffectiveDimensionVsFLOP"] = True
     latex_figures["EffectiveDimensionVsFLOP"] = fig = scatter(
         data,
@@ -3082,15 +2690,42 @@ if HAS_CSVS:
         log_x=2,
         log_y=2,
         reverse_xaxis=False,
-        color_order=[category_name_remap[c] for c in category_order],
+        color_order=[category_name_remap_short[c] for c in category_order],
         xaxis="FLOPs to Verify Proof (approximate)",
         yaxis="Unexplained Dimension (Estimated)",
+        plot_with=PLOT_WITH,
+        renderer=RENDERER,
+    )
+    latex_externalize_tables["EffectiveDimensionVsFLOPDiscontinuousXY"] = True
+    latex_figures["EffectiveDimensionVsFLOPDiscontinuousXY"] = fig = scatter(
+        data,
+        x="proof-flop-estimate",
+        y="effective-dimension-estimate",
+        color="group",
+        title="",
+        log_x=2,
+        log_y=2,
+        reverse_xaxis=False,
+        color_order=[category_name_remap_short[c] for c in category_order],
+        xaxis="FLOPs to Verify Proof (approximate)",
+        yaxis="Unexplained Dimension (Estimated)",
+        discontinuous_x=(
+            data[(data["group"] == "brute force") | (data["group"] == "cubic")][
+                "proof-flop-estimate"
+            ].mean(),
+        ),
+        discontinuous_y=(
+            data[(data["group"] == "brute force") | (data["group"] == "cubic")][
+                "effective-dimension-estimate"
+            ].mean(),
+        ),
         plot_with=PLOT_WITH,
         renderer=RENDERER,
     )
 
 
 # %%
+plt.rcParams["axes.prop_cycle"] = cycler(color=plt.cm.Paired.colors)
 if HAS_CSVS:
     for frontier_only in (True, False):
         for norm, normt in (("", ""), ("normalized-", "Normalized ")):
@@ -3107,6 +2742,11 @@ if HAS_CSVS:
             data = data.sort_values(
                 by=["group", f"{norm}accuracy-bound", "proof-flop-estimate"]
             )
+            discontinuous_x = (
+                data[(data["group"] == "brute force") | (data["group"] == "cubic")][
+                    "proof-flop-estimate"
+                ].mean(),
+            )
             data["group"] = data["group"].map(category_name_remap)
             latex_externalize_tables[key] = True
             latex_figures[key] = fig = scatter(
@@ -3120,6 +2760,22 @@ if HAS_CSVS:
                 xaxis="FLOPs to Verify Proof (approximate)",
                 yaxis=f"{normt}Accuracy Bound",
                 color_order=[category_name_remap[c] for c in category_order],
+                plot_with=PLOT_WITH,
+                renderer=RENDERER,
+            )
+            latex_externalize_tables[f"{key}DiscontinuousX"] = True
+            latex_figures[f"{key}DiscontinuousX"] = fig = scatter(
+                data,
+                x="proof-flop-estimate",
+                y=f"{norm}accuracy-bound",
+                color="group",
+                title="",  # "Pareto Frontier" if frontier_only else "",
+                log_x=2,
+                reverse_xaxis=False,
+                xaxis="FLOPs to Verify Proof (approximate)",
+                yaxis=f"{normt}Accuracy Bound",
+                color_order=[category_name_remap[c] for c in category_order],
+                discontinuous_x=discontinuous_x,
                 plot_with=PLOT_WITH,
                 renderer=RENDERER,
             )
@@ -3138,6 +2794,7 @@ if HAS_CSVS:
                 "tricks",
             ]
         ].copy()
+        data = double_singleton_groups(data.drop_duplicates(), column="group")
         # data["group"] = data["group"].map({k:k[:7] for k in set(data["group"])})
         fig = px.scatter(
             data,
@@ -3210,6 +2867,8 @@ title_reps = {
     r"\mathrm{EQKP}": r"\EPQKP ",
     r"d_{\mathrm{model}}": r"\dmodel ",
     r"d_{\mathrm{vocab}}": r"\dvocab ",
+    r"QK^T": r"\WQ\WK^T",
+    r"×": r"\ensuremath{\times}",
 }
 
 
@@ -3358,11 +3017,31 @@ def texify_matplotlib_title(
 
 
 errs = []
+
+
+def wrap_err(f, *args, return_bool: bool = False, **kwargs):
+    try:
+        result = f(*args, **kwargs)
+        return True if return_bool else result
+    except FileNotFoundError as e:
+        print(f"Warning: {e}")
+        errs.append(e)
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: {e}")
+        errs.append(e)
+    except OSError as e:
+        print(f"Warning: {e}")
+        errs.append(e)
+    if return_bool:
+        return False
+
+
 for file_path in chain(
     LATEX_FIGURE_PATH.glob("*.png"), LATEX_FIGURE_PATH.glob("*.dat")
 ):
     file_path.unlink()
     print(f"Deleted: {file_path}")
+table_row_sep = r"\\" + "\n"
 for k, fig in latex_figures.items():
     if isinstance(fig, go.Figure):
         fig.update_layout(font_family="Computer Modern")  # Use LaTeX fonts
@@ -3382,53 +3061,61 @@ for k, fig in latex_figures.items():
                     p.parent.mkdir(parents=True, exist_ok=True)
                     fig.write_image(p)
                     if ext == ".pdf":
-                        try:
-                            subprocess.run(["pdfcrop", p, p], check=True)
-                        except FileNotFoundError as e:
-                            print(f"Warning: {e}")
-                            errs.append(e)
+                        wrap_err(subprocess.run, ["pdfcrop", p, p], check=True)
     elif isinstance(fig, matplotlib.figure.Figure):
         p = LATEX_FIGURE_PATH / f"{k}.tex"
         p.parent.mkdir(parents=True, exist_ok=True)
-        if latex_externalize_tables.get(k, False):
+        externalize_this_table = latex_externalize_tables.get(k, True)
+        if externalize_this_table:
             if not latex_only_externalize_tables.get(k, False):
                 p = LATEX_FIGURE_PATH / f"{k}ExternalTables.tex"
             print(f"Saving {p}...")
             with texify_matplotlib_title(fig) as fig:
                 tikzplotlib.save(
-                    p, fig, externalize_tables=latex_externalize_tables.get(k, False)
+                    p,
+                    fig,
+                    externalize_tables=externalize_this_table,
+                    table_row_sep=table_row_sep,
                 )
         p = LATEX_FIGURE_PATH / f"{k}.tex"
         print(f"Saving {p}...")
         with texify_matplotlib_title(fig, replace_with_macros=True) as fig:
-            tikzplotlib.save(p, fig, externalize_tables=False)
+            tikzplotlib.save(
+                p, fig, externalize_tables=False, table_row_sep=table_row_sep
+            )
         for ext in (".pdf", ".svg"):
             p = LATEX_FIGURE_PATH / f"{k}{ext}"
             print(f"Saving {p}...")
             p.parent.mkdir(parents=True, exist_ok=True)
             fig.savefig(p)
             if ext == ".pdf":
-                try:
-                    subprocess.run(["pdfcrop", p, p], check=True)
-                except FileNotFoundError as e:
-                    print(f"Warning: {e}")
-                    errs.append(e)
+                wrap_err(subprocess.run, ["pdfcrop", p, p], check=True)
     else:
         raise TypeError(f"Unsupported figure {fig} of type {type(fig)}")
 
+
 for f in LATEX_FIGURE_PATH.glob("*.png"):
-    try:
-        image_utils.pngcrush(f)
-    except FileNotFoundError as e:
-        print(f"Warning: {e}")
-        errs.append(e)
+    wrap_err(image_utils.ect, f)
+    wrap_err(image_utils.pngcrush, f)
+    wrap_err(image_utils.optipng, f)
 
-    try:
-        image_utils.optipng(f)
-    except FileNotFoundError as e:
-        print(f"Warning: {e}")
-        errs.append(e)
+opt_success = wrap_err(
+    image_utils.optimize,
+    *LATEX_FIGURE_PATH.glob("*.png"),
+    exhaustive=True,
+    return_bool=True,
+)
 
+if not opt_success:
+    for f in LATEX_FIGURE_PATH.glob("*.png"):
+        wrap_err(image_utils.optimize, f, exhaustive=True)
+
+
+if errs:
+    print("Errors:")
+    for e in errs:
+        print(e)
+    print(f"Total errors: {len(errs)}")
 for e in errs:
     raise e
 # %%

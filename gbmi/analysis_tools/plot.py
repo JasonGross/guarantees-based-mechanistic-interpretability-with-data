@@ -1,16 +1,35 @@
 # %%
+import math
+from functools import partial
 from pathlib import Path
-from typing import Callable, Collection, Literal, Optional, Tuple, Union
+from typing import (
+    Callable,
+    Collection,
+    Literal,
+    Optional,
+    Tuple,
+    Union,
+    Sequence,
+    Any,
+    TypeVar,
+)
+from collections import defaultdict
 import imageio
-from matplotlib.colors import Colormap, to_hex, is_color_like
+from matplotlib.colors import Colormap, hsv_to_rgb, rgb_to_hsv, to_hex, is_color_like
 import torch
 import numpy as np
 from torch import Tensor
 from jaxtyping import Float
 import matplotlib.pyplot as plt
 import matplotlib.figure
+import matplotlib as mpl
+import matplotlib.axes
+import matplotlib.axes._axes
+import matplotlib.cm as cm
+import matplotlib.colors as mcolors
+from cycler import cycler
 import pandas as pd
-from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 import seaborn as sns
 import plotly.graph_objects as go
 import plotly.express as px
@@ -24,6 +43,55 @@ from gbmi.analysis_tools.utils import pm_range, pm_mean_std, pm_round
 from gbmi.verification_tools.l1h1 import all_EVOU, all_PVOU
 
 Colorscale = Union[str, Collection[Collection[Union[float, str]]]]
+T = TypeVar("T")
+
+
+def cmap_to_list(
+    cmap: Union[str, ListedColormap], num_samples: int = 256
+) -> list[Tuple[float, str]]:
+    if isinstance(cmap, str):
+        return cmap_to_list(plt.cm.get_cmap(cmap))
+
+    if isinstance(cmap, mcolors.ListedColormap):
+        colors = cmap.colors
+        num_colors = len(colors)
+
+        color_list = []
+
+        for i, color in enumerate(colors):
+            # Position as a fraction (0 to 1)
+            position = i / (num_colors - 1)
+            # Convert RGB tuple to hex string
+            hex_color = mcolors.rgb2hex(color)
+            color_list.append((position, hex_color))
+
+        return color_list
+    elif isinstance(cmap, mcolors.LinearSegmentedColormap):
+        color_list = []
+
+        for i in range(num_samples):
+            # Position as a fraction (0 to 1)
+            position = i / (num_samples - 1)
+            # Get the color at this position
+            rgba = cmap(position)
+            # Convert RGBA tuple to hex string
+            hex_color = mcolors.rgb2hex(rgba)
+            color_list.append((position, hex_color))
+
+        return color_list
+    else:
+        raise ValueError(
+            f"{cmap} ({type(cmap)}) is not a ListedColormap nor LinearSegmentedColormap"
+        )
+
+
+def shift_cyclical_colorscale(
+    colors: list[Tuple[float, T]], shift: int = 0
+) -> list[Tuple[float, T]]:
+    pos = [c[0] for c in colors]
+    colors = [c[1] for c in colors]
+    mid = len(colors) // 2
+    return list(zip(pos, colors[mid + shift :] + colors[: mid + shift]))
 
 
 def normalize_rgba(rgba):
@@ -44,6 +112,72 @@ def color_to_hex(color: str) -> str:
         return to_hex(color)
     else:
         raise ValueError(f"Unrecognized color format: {color}")
+
+
+def hex_to_rgb_float(hex_color: str) -> Tuple[float, float, float]:
+    """Convert a hex color string to an RGB float tuple."""
+    return tuple(int(hex_color[i : i + 2], 16) / 255.0 for i in (1, 3, 5))
+
+
+GET_GRADIENT_N_STEPS_DEFAULT: int = 10
+
+
+def get_gradient(
+    hex_start: str, hex_end: str, n_steps: int = GET_GRADIENT_N_STEPS_DEFAULT
+) -> np.ndarray:
+    rgb_start = hex_to_rgb_float(hex_start)
+    rgb_end = hex_to_rgb_float(hex_end)
+
+    hsv_start = rgb_to_hsv(np.array([rgb_start]))[0]
+    hsv_end = rgb_to_hsv(np.array([rgb_end]))[0]
+
+    # Interpolate HSV values
+    hues = np.linspace(hsv_start[0], hsv_end[0], n_steps)
+    saturations = np.linspace(hsv_start[1], hsv_end[1], n_steps)
+    values = np.linspace(hsv_start[2], hsv_end[2], n_steps)
+
+    # Combine interpolated HSV values
+    hsv_gradient = np.column_stack((hues, saturations, values))
+
+    # Convert HSV to RGB
+    rgb_gradient = hsv_to_rgb(hsv_gradient)
+
+    return rgb_gradient
+
+
+def interpolate_gradient(
+    seq: Sequence[str],
+    n_steps: Optional[int] = None,
+    n_total_steps: Optional[int] = None,
+) -> list[str]:
+    if n_steps is None and n_total_steps is None:
+        n_steps = GET_GRADIENT_N_STEPS_DEFAULT
+    elif n_steps is None:
+        n_steps = n_total_steps // (len(seq) - 1)
+    gradient = []
+    for i in range(len(seq) - 1):
+        gradient.extend(get_gradient(seq[i], seq[i + 1], n_steps=n_steps))
+    return [to_hex(color) for color in gradient]
+
+
+def combine_interpolate_color_mapping(
+    colors_1: Sequence[str],
+    colors_2: Sequence[str],
+    mid_color: Optional[str] = "#ffffff",
+    mid: float = 0.485,
+    n_steps: Optional[int] = None,
+    n_total_steps: Optional[int] = None,
+) -> list[Tuple[float, str]]:
+    hex_1 = interpolate_gradient(colors_1, n_steps=n_steps, n_total_steps=n_total_steps)
+    hex_2 = interpolate_gradient(colors_2, n_steps=n_steps, n_total_steps=n_total_steps)
+
+    all_hex = []
+    all_hex += list(zip(np.linspace(0, mid, len(hex_1)), hex_1))
+    if mid_color is not None:
+        all_hex += [(0.5, mid_color)]
+    all_hex += list(zip(np.linspace(1 - mid, 1, len(hex_2)), hex_2))
+
+    return all_hex
 
 
 def colorscale_to_cmap(colorscale: Colorscale, *, name: str = "custom") -> Colormap:
@@ -118,6 +252,7 @@ def imshow_matplotlib(
 ):
     cmap = colorscale_to_cmap(colorscale)
     fig, ax = plt.subplots(figsize=figsize)
+    plt.close()
     sns.heatmap(
         utils.to_numpy(tensor),
         ax=ax,
@@ -154,6 +289,7 @@ def imshow_matplotlib(
     if title is not None:
         ax.set_title(title)
     if show:
+        plt.figure(fig)
         plt.show()
     return fig
 
@@ -300,12 +436,16 @@ def scatter_plotly(
     reverse_xaxis: bool = False,
     reverse_yaxis: bool = False,
     color_order: Optional = None,
+    yrange: Optional[Tuple[float, float]] = None,
+    discontinuous_x: Sequence[float] = (),
+    discontinuous_y: Sequence[float] = (),
+    # prop_cycle: dict[str, Any] = {},
     **kwargs,
 ):
     # x = utils.to_numpy(x)
     # y = utils.to_numpy(y)
     # labels = {"x": xaxis, "y": yaxis, "color": caxis}
-    labels = {"index": xaxis, "variable": caxis, "value": yaxis}
+    labels = {"index": xaxis, "x": xaxis, "variable": caxis, "value": yaxis, "y": yaxis}
     fig = px.scatter(*data, labels=labels, **kwargs)
     if legend_at_bottom:
         fig.update_layout(
@@ -321,6 +461,8 @@ def scatter_plotly(
         fig.update_layout(yaxis=dict(autorange="reversed"))
     if reverse_xaxis:
         fig.update_layout(xaxis=dict(autorange="reversed"))
+    if yrange is not None:
+        fig.update_yaxes(range=yrange)
     if show:
         fig.show(renderer)
     return fig
@@ -349,11 +491,66 @@ def scatter_matplotlib(
     reverse_yaxis: bool = False,
     legend: Optional[bool] = None,
     yrange: Optional[Tuple[float, float]] = None,
+    discontinuous_x: Sequence[float] = (),
+    discontinuous_y: Sequence[float] = (),
+    # prop_cycle: dict[str, Any] = {},
     **kwargs,
 ):
     # x = utils.to_numpy(x)
     # y = utils.to_numpy(y)
-    fig, ax = plt.subplots()
+    fig, axes = plt.subplots(
+        nrows=len(discontinuous_y) + 1,
+        ncols=len(discontinuous_x) + 1,
+        sharey="row",
+        sharex="col",
+        squeeze=False,
+    )
+    if not show:
+        plt.close()
+    # for ax in axes:
+    #     ax.set_prop_cycle(cycler(**prop_cycle))
+    data_minx: dict[int, float] = defaultdict(lambda: np.inf)
+    data_maxx: dict[int, float] = defaultdict(lambda: -np.inf)
+    data_miny: dict[int, float] = defaultdict(lambda: np.inf)
+    data_maxy: dict[int, float] = defaultdict(lambda: -np.inf)
+    missing: dict[Tuple[int, int], bool] = defaultdict(lambda: False)
+
+    def axes_scatter(all_x, all_y, **kwargs):
+        remaining_points = list(zip(all_x, all_y))
+        y_ubounds = [-np.inf] + list(discontinuous_y) + [np.inf]
+        x_ubounds = [-np.inf] + list(discontinuous_x) + [np.inf]
+        for r, row in enumerate(axes if reverse_yaxis else reversed(axes)):
+            for c, ax in enumerate(row if not reverse_xaxis else reversed(row)):
+                y_ubound, x_ubound = y_ubounds[r + 1], x_ubounds[c + 1]
+                y_lbound, x_lbound = y_ubounds[r], x_ubounds[c]
+                cur_x, cur_y = [], []
+                next_points = []
+                for x, y in remaining_points:
+                    if x_lbound < x <= x_ubound and y_lbound < y <= y_ubound:
+                        cur_x.append(x)
+                        cur_y.append(y)
+                    else:
+                        next_points.append((x, y))
+                remaining_points = next_points
+                # print(r, c, cur_x, cur_y, next_points)
+                if cur_x:
+                    ax.scatter(cur_x, cur_y, **kwargs)
+                    data_minx[c] = np.min([data_minx[c], *cur_x])
+                    data_maxx[c] = np.max([data_maxx[c], *cur_x])
+                    data_miny[r] = np.min([data_miny[r], *cur_y])
+                    data_maxy[r] = np.max([data_maxy[r], *cur_y])
+                    # print(r, c, dict(data_minx), dict(data_maxx), dict(data_miny), dict(data_maxy))
+                else:
+                    ax.scatter(all_x[:1], all_y[:1], **kwargs)
+                    missing[(r, c)] = True
+        assert len(remaining_points) == 0, (remaining_points, x_ubounds, y_ubounds)
+
+    def on_all_axes(f: Callable[[matplotlib.axes._axes.Axes], Any], axes=axes):
+        if isinstance(axes, np.ndarray):
+            return [on_all_axes(f, ax) for ax in axes]
+        return f(axes)
+
+    right_ax = axes[0, -1]
     # sns_kwargs = {}
     # if len(data) == 1 and isinstance(data[0], dict):
     #     data = list(data)
@@ -366,13 +563,13 @@ def scatter_matplotlib(
     if len(data) == 1 and isinstance(data[0], dict):
         for (k, v), marker in zip(data[0].items(), better_unique_markers(len(data[0]))):
             x = range(len(v))
-            plt.scatter(x, v, label=k, marker=marker)
+            axes_scatter(x, v, label=k, marker=marker)
         if not legend_at_bottom:
-            box = ax.get_position()
-            ax.set_position([box.x0, box.y0, box.width * 0.8, box.height])
+            box = right_ax.get_position()
+            right_ax.set_position([box.x0, box.y0, box.width * 0.8, box.height])
 
             # Put a legend to the right of the current axis
-            ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+            right_ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))
     elif (
         len(data) == 1
         and isinstance(data[0], pd.DataFrame)
@@ -386,14 +583,14 @@ def scatter_matplotlib(
                 legend = True
             for group, marker in zip(groups, better_unique_markers(len(groups))):
                 subset = data[data[kwargs["color"]] == group]
-                ax.scatter(
+                axes_scatter(
                     subset[kwargs["x"]],
                     subset[kwargs["y"]],
                     label=group,
                     # color=
                 )
         else:
-            ax.scatter(
+            axes_scatter(
                 data[kwargs["x"]],
                 data[kwargs["y"]],
                 # label=group,
@@ -404,38 +601,114 @@ def scatter_matplotlib(
         for k in list(kwargs.keys()):
             if k in sns_remap and sns_remap[k] not in kwargs:
                 kwargs[sns_remap[k]] = kwargs.pop(k)
-        sns.scatterplot(*data, ax=ax, **kwargs)
+        on_all_axes(lambda ax: sns.scatterplot(*data, ax=ax, **kwargs))
     if legend_at_bottom:
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), shadow=True)
+        right_ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), shadow=True)
     elif legend:
-        box = ax.get_position()
-        ax.set_position([box.x0, box.y0, box.width * 0.8, box.height])
+        box = right_ax.get_position()
+        right_ax.set_position([box.x0, box.y0, box.width * 0.8, box.height])
 
         # Put a legend to the right of the current axis
-        ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))
+        right_ax.legend(loc="center left", bbox_to_anchor=(1, 0.5))
         # ax.legend(loc='upper right', bbox_to_anchor=(0, 0, 1, 1))
-    ax.set_xlabel(xaxis)
-    ax.set_ylabel(yaxis)
+    rmid = axes.shape[0] // 2
+    cmid = axes.shape[1] // 2
+    axes[-1, cmid].set_xlabel(xaxis)
+    axes[rmid, 0].set_ylabel(yaxis)
     if log_x:
         if isinstance(log_x, bool):
-            ax.set_xscale("log")
+            on_all_axes(lambda ax: ax.set_xscale("log"))
         else:
-            ax.set_xscale("log", base=log_x)
+            on_all_axes(lambda ax: ax.set_xscale("log", base=log_x))
     if log_y:
         if isinstance(log_y, bool):
-            ax.set_yscale("log")
+            on_all_axes(lambda ax: ax.set_yscale("log"))
         else:
-            ax.set_yscale("log", base=log_y)
+            on_all_axes(lambda ax: ax.set_yscale("log", base=log_y))
     if reverse_xaxis:
-        ax.invert_xaxis()
+        on_all_axes(lambda ax: ax.invert_xaxis())
     if reverse_yaxis:
-        ax.invert_yaxis()
+        on_all_axes(lambda ax: ax.invert_yaxis())
     if yrange is not None:
-        ax.set_ylim(*yrange)
+        on_all_axes(lambda ax: ax.set_ylim(*yrange))
+    if discontinuous_y:
+        fig.subplots_adjust(hspace=0.15)
+    if discontinuous_x:
+        fig.subplots_adjust(wspace=0.15)
+    for row in axes[:-1]:
+        for ax in row:
+            ax.xaxis.tick_top()
+    for row in axes[-1:]:
+        for ax in row:
+            ax.xaxis.tick_bottom()
+    for row in axes:
+        for ax in row[:1]:
+            ax.yaxis.tick_left()
+        for ax in row[1:]:
+            ax.yaxis.tick_right()
+    for row in axes:
+        # hide the spines between axes
+        for ax in row[:-1]:
+            ax.spines["right"].set_visible(False)
+        # for ax in row[:1]:
+        #     ax.yaxis.tick_left()
+        for ax in row[1:]:
+            # ax.yaxis.tick_right()
+            ax.spines["left"].set_visible(False)
+            ax.tick_params(labelleft="off", left=False)
+            for tick in ax.get_yticklabels():
+                tick.set_visible(False)
+            # ax.set_yticks([])
+    for row in axes[:-1]:
+        for ax in row:
+            # ax.xaxis.tick_top()
+            ax.spines.bottom.set_visible(False)
+            ax.tick_params(labelbottom="off", bottom=False)
+            for tick in ax.get_xticklabels():
+                tick.set_visible(False)
+            # ax.set_xticks([])
+    for row in axes[1:]:
+        for ax in row:
+            ax.spines.top.set_visible(False)
+    on_all_axes(lambda ax: ax.tick_params(labeltop="off", labelright="off"))
+
+    def adjust_range(lo, hi, log_base):
+        if log_base is True:
+            log_base = 10
+        do_log = (lambda x: x) if not log_base else (lambda x: math.log(x, log_base))
+        do_exp = (lambda x: x) if not log_base else partial(math.pow, log_base)
+        lo = do_log(lo)
+        hi = do_log(hi)
+        r = 1.1 * (hi - lo) or 2
+        return do_exp(lo - r), do_exp(hi + r)
+
+    if discontinuous_y:
+        for r, row in enumerate(axes):
+            for c, ax in enumerate(row):
+                if (
+                    np.isfinite(data_maxy[r])
+                    and np.isfinite(data_miny[r])
+                    and missing[(r, c)]
+                ):
+                    # print(f"axes[{r}, {c}].set_ylim({data_miny[r] - extra}, {data_maxy[r] + extra})")
+                    ax.set_ylim(*adjust_range(data_miny[r], data_maxy[r], log_y))
+    if discontinuous_x:
+        for r, row in enumerate(axes):
+            for c, ax in enumerate(row):
+                # print(data_minx, data_maxx)
+                # print(r, c, np.isfinite(data_maxx[c]), np.isfinite(data_minx[c]), missing[(r, c)])
+                if (
+                    np.isfinite(data_maxx[c])
+                    and np.isfinite(data_minx[c])
+                    and missing[(r, c)]
+                ):
+                    # print(f"axes[{r}, {c}].set_xlim({data_minx[c] - extra}, {data_maxx[c] + extra})")
+                    ax.set_xlim(*adjust_range(data_minx[c], data_maxx[c], log_x))
     if title is not None:
         fig.suptitle(title)
-    plt.tight_layout()
+    fig.tight_layout()
     if show:
+        plt.figure(fig)
         plt.show()
     return fig
 
@@ -516,6 +789,7 @@ def hist_matplotlib(
     if isinstance(data, dict):
         data = pd.DataFrame(data)
     fig, ax = plt.subplots(figsize=figsize)
+    plt.close()
     sns.histplot(data=data, ax=ax, **kwargs)
     ax.set_xlabel(xaxis)
     ax.set_ylabel(yaxis)
@@ -524,6 +798,7 @@ def hist_matplotlib(
     if title is not None:
         ax.set_title(title)
     if show:
+        plt.figure(fig)
         plt.show()
     return fig
 
@@ -561,6 +836,112 @@ def hist(
                 variable=variable,
                 column_names=column_names,
                 show=show,
+                **kwargs,
+            )
+
+
+def colorbar_plotly(
+    zmin: float,
+    zmax: float,
+    colorscale: Colorscale = "RdBu",
+    *,
+    orientation: Literal["vertical", "horizontal"] = "vertical",
+    show: bool = True,
+    renderer: Optional[str] = None,
+    **kwargs,
+):
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=[[0]],
+            colorscale=colorscale,
+            showscale=True,
+            zmin=zmin,
+            zmax=zmax,
+            # zmid=0,
+            colorbar=dict(x=0),
+        )
+    )
+    fig.add_trace(
+        go.Heatmap(
+            z=[[0]],
+            colorscale="Picnic_r",
+            showscale=False,
+            zmin=zmin,
+            zmax=zmax,
+            zmid=0,
+        )
+    )
+    fig.update_layout(
+        width=75,
+        xaxis_showgrid=False,
+        yaxis_showgrid=False,
+        xaxis_zeroline=False,
+        yaxis_zeroline=False,
+        xaxis_visible=False,
+        yaxis_visible=False,
+        margin=dict(l=0, r=0, b=0, t=0),
+    )
+    if show:
+        fig.show(renderer)
+    return fig
+
+
+def colorbar_matplotlib(
+    zmin: float,
+    zmax: float,
+    colorscale: Colorscale = "RdBu",
+    *,
+    orientation: Literal["vertical", "horizontal"] = "vertical",
+    show: bool = True,
+    renderer: Optional[str] = None,
+    **kwargs,
+):
+    cmap = colorscale_to_cmap(colorscale)
+    fig = plt.figure(figsize=(0.5, 4) if orientation == "vertical" else (4, 0.5))
+    plt.close()
+    norm = matplotlib.colors.Normalize(vmin=zmin, vmax=zmax)
+    cbar = fig.colorbar(
+        cm.ScalarMappable(norm=norm, cmap=cmap),
+        cax=fig.gca(),
+        orientation=orientation,
+    )
+    # cbar = matplotlib.colorbar.ColorbarBase(
+    #     plt.gca(), cmap=cmap, norm=norm, orientation="vertical"
+    # )
+    if show:
+        plt.figure(fig)
+        plt.show()
+    return fig
+
+
+def colorbar(
+    zmin: float,
+    zmax: float,
+    colorscale: Colorscale = "RdBu",
+    *,
+    orientation: Literal["vertical", "horizontal"] = "vertical",
+    show: bool = True,
+    plot_with: Literal["plotly", "matplotlib"] = "plotly",
+    renderer: Optional[str] = None,
+    **kwargs,
+):
+    match plot_with:
+        case "plotly":
+            return colorbar_plotly(
+                zmin=zmin,
+                zmax=zmax,
+                colorscale=colorscale,
+                show=show,
+                orientation=orientation,
+                **kwargs,
+            )
+        case "matplotlib":
+            return colorbar_matplotlib(
+                zmin=zmin,
+                zmax=zmax,
+                colorscale=colorscale,
+                show=show,
+                orientation=orientation,
                 **kwargs,
             )
 
@@ -716,6 +1097,7 @@ def hist_EVOU_max_logit_diff(
     mean_PVOU: bool = False,
     plot_with: Literal["plotly", "matplotlib"] = "plotly",
     renderer: Optional[str] = None,
+    show: bool = True,
 ) -> Tuple[
     Union[go.Figure, matplotlib.figure.Figure], Float[Tensor, "d_vocab"]  # noqa: F821
 ]:
@@ -752,6 +1134,7 @@ def hist_EVOU_max_logit_diff(
         column_names="",
         plot_with=plot_with,
         renderer=renderer,
+        show=show,
     )
     return fig, max_logit_diff
 
@@ -767,6 +1150,7 @@ def weighted_histogram(
     yaxis: str = "count",
     column_name: str = "",
     title: Optional[str] = None,
+    show: bool = True,
     **kwargs,
 ):
     if num_bins is None:
@@ -791,23 +1175,29 @@ def weighted_histogram(
                 y=hist_counts,
                 labels={"x": xaxis, "y": yaxis},
                 title=title,
-                **kwargs,
+                **{k: v for k, v in kwargs.items() if k != "edgecolor"},
             )
             fig.update_layout(bargap=0)
             # Iterate over each trace (bar chart) in the figure and adjust the marker properties
-            for trace in fig.data:
-                if trace.type == "bar":  # Check if the trace is a bar chart
-                    # Update marker properties to remove the border line or adjust its appearance
-                    trace.marker.line.width = (
-                        0  # Set line width to 0 to remove the border
-                    )
-                    # Optionally, you can also set the line color to match the bar color exactly
-                    trace.marker.line.color = trace.marker.color = (
-                        "rgba(0, 0, 255, 1.0)"
-                    )
-            fig.show(renderer)
+            if "edgecolor" in kwargs:
+                for trace in fig.data:
+                    if trace.type == "bar":  # Check if the trace is a bar chart
+                        if kwargs["edgecolor"] == "none":
+                            # Update marker properties to remove the border line or adjust its appearance
+                            trace.marker.line.width = (
+                                0  # Set line width to 0 to remove the border
+                            )
+                            # Optionally, you can also set the line color to match the bar color exactly
+                            trace.marker.line.color = trace.marker.color = (
+                                "rgba(0, 0, 255, 1.0)"
+                            )
+                        else:
+                            trace.marker.line.color = kwargs["edgecolor"]
+            if show:
+                fig.show(renderer)
         case "matplotlib":
             fig, ax = plt.subplots()
+            plt.close()
             df = pd.DataFrame({"data": data, "weights": weights})
             sns.histplot(
                 df,
@@ -815,7 +1205,6 @@ def weighted_histogram(
                 bins=num_bins,
                 ax=ax,
                 x="data",
-                edgecolor="none",
                 **kwargs,
             )
             if not column_name and ax.get_legend() is not None:
@@ -824,7 +1213,9 @@ def weighted_histogram(
             if title is not None:
                 ax.set_title(title)
             # ax.bar(bin_centers, hist_counts, width=np.diff(bins), align="center")
-            plt.show()
+            if show:
+                plt.figure(fig)
+                plt.show()
     return fig
 
 
@@ -875,3 +1266,97 @@ def plotly_save_gif(
     if cleanup_frames:
         for filename in filenames:
             filename.unlink()
+
+
+# %%
+def discriminate_figure(
+    fig: Union[go.Figure, matplotlib.figure.Figure],
+    *,
+    plotly_attrs=("update_layout",),
+    matplotlib_attrs=("axes",),
+) -> Literal["plotly", "matplotlib"]:
+    has_plotly_attrs = [hasattr(fig, attr) for attr in plotly_attrs]
+    has_matplotlib_attrs = [hasattr(fig, attr) for attr in matplotlib_attrs]
+    is_plotly = [isinstance(fig, go.Figure), all(has_plotly_attrs)] + has_plotly_attrs
+    is_matplotlib = [
+        isinstance(fig, matplotlib.figure.Figure),
+        all(has_matplotlib_attrs),
+    ] + has_matplotlib_attrs
+    while len(is_plotly) > 0 or len(is_matplotlib) > 0:
+        if len(is_plotly) > 0 and is_plotly[0]:
+            return "plotly"
+        elif len(is_matplotlib) > 0 and is_matplotlib[0]:
+            return "matplotlib"
+        else:
+            if len(is_plotly) > 0:
+                is_plotly.pop(0)
+            if len(is_matplotlib) > 0:
+                is_matplotlib.pop(0)
+    assert len(is_plotly) == 0 and len(is_matplotlib) == 0, (is_plotly, is_matplotlib)
+    raise ValueError(f"Could not determine the type of figure {fig} ({type(fig)})")
+
+
+def remove_titles(
+    fig: Union[go.Figure, matplotlib.figure.Figure],
+):
+    match discriminate_figure(fig):
+        case "plotly":
+            for trace in fig.data:
+                trace.update(name="")
+            fig.update_layout(title_text="")
+        case "matplotlib":
+            for ax in fig.axes:
+                ax.set_title("")
+            fig.suptitle("")
+    return fig
+
+
+def remove_axis_labels(
+    fig: Union[go.Figure, matplotlib.figure.Figure],
+):
+    match discriminate_figure(fig):
+        case "matplotlib":
+            for ax in fig.axes:
+                ax.set_xlabel("")
+                ax.set_ylabel("")
+        case "plotly":
+            fig.update_layout(xaxis_title="", yaxis_title="")
+    return fig
+
+
+def remove_colorbars(
+    fig: Union[go.Figure, matplotlib.figure.Figure],
+):
+    match discriminate_figure(fig):
+        case "matplotlib":
+            for ax in fig.axes:
+                for cax in ax.get_children():
+                    if getattr(cax, "colorbar", None) is not None:
+                        cax.colorbar.remove()
+        case "plotly":
+            fig.update(layout_coloraxis_showscale=False)
+            # for trace in fig.data:
+            #     if "colorbar" in trace:
+            #         trace.colorbar = None
+    return fig
+
+
+def remove_axis_ticklabels(
+    fig: Union[go.Figure, matplotlib.figure.Figure],
+    *,
+    remove_tickmarks: bool = False,
+):
+    match discriminate_figure(fig):
+        case "matplotlib":
+            for ax in fig.axes:
+                ax.set_xticklabels([])
+                ax.set_yticklabels([])
+                if remove_tickmarks:
+                    ax.tick_params(axis="both", which="both", length=0)
+        case "plotly":
+            fig.update_xaxes(showticklabels=False)
+            fig.update_yaxes(showticklabels=False)
+            if remove_tickmarks:
+                fig.update_xaxes(ticks="")
+                fig.update_yaxes(ticks="")
+    return fig

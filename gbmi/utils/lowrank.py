@@ -3,6 +3,7 @@ from torch import Tensor
 import torch
 from jaxtyping import Float
 from typing import TypeVar, Union, Optional, overload
+import numpy as np
 import plotly.express as px
 
 # from transformer_lens import FactoredMatrix
@@ -24,6 +25,35 @@ def _via_tensor(attr: str, rattr: Optional[str] = None):
                 except TypeError as er:
                     raise TypeError(e, er)
             raise e
+
+    if hasattr(Tensor, attr):
+        reference = getattr(Tensor, attr)
+        for docattr in ("__doc__", "__name__"):
+            if hasattr(reference, docattr):
+                setattr(delegate, docattr, getattr(reference, docattr))
+    return delegate
+
+
+def _via_broadcast_float_or_tensor(attr: str, rattr: Optional[str] = None):
+    def delegate(self: LowRankTensor, other, *args, **kwargs):
+        def subdelegate(m):
+            try:
+                return getattr(m, attr)(other, *args, **kwargs)
+            except TypeError as e:
+                if rattr is not None:
+                    try:
+                        return getattr(other, rattr)(m, *args, **kwargs)
+                    except TypeError as er:
+                        raise TypeError(e, er)
+                else:
+                    raise e
+
+        if isinstance(other, float):
+            if np.prod(self.A.shape) <= np.prod(self.B.shape):
+                return LowRankTensor(subdelegate(self.A), self.B, **self.params())  # type: ignore
+            else:
+                return LowRankTensor(self.A, subdelegate(self.B), **self.params())  # type: ignore
+        return _via_tensor(attr, rattr)(self, other, *args, **kwargs)
 
     if hasattr(Tensor, attr):
         reference = getattr(Tensor, attr)
@@ -200,3 +230,9 @@ class LowRankTensor(FactoredMatrix):
     __radd__ = _via_tensor("__radd__", "__add__")
     __sub__ = _via_tensor("__sub__", "__rsub__")
     __rsub__ = _via_tensor("__rsub__", "__sub__")
+    __div__ = _via_broadcast_float_or_tensor("__div__", "__rdiv__")
+    __rdiv__ = _via_broadcast_float_or_tensor("__rdiv__", "__div__")
+    __truediv__ = _via_broadcast_float_or_tensor("__truediv__", "__rtruediv__")
+    __rtruediv__ = _via_broadcast_float_or_tensor("__rtruediv__", "__truediv__")
+    __mul__ = _via_broadcast_float_or_tensor("__mul__", "__rmul__")
+    __rmul__ = _via_broadcast_float_or_tensor("__rmul__", "__mul__")

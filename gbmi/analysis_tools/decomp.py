@@ -246,8 +246,11 @@ def analyze_svd(
     colorscale: Colorscale = "Picnic_r",
     singular_color="blue",
     figsize: Optional[Tuple[int, int]] = (15, 5),
+    remove_colorbar: bool = True,
+    zmax: float = -np.inf,
     plot_with: Literal["plotly", "matplotlib"] = "plotly",
     renderer: Optional[str] = None,
+    show: bool = True,
 ):
     U, S, Vh = torch.linalg.svd(M)
     V = Vh.T
@@ -259,6 +262,7 @@ def analyze_svd(
         descr = f" for {descr}"
 
     uzmax, vzmax = U.abs().max().item(), V.abs().max().item()
+    zmax = max(zmax, max(uzmax, vzmax))
     cmap = colorscale_to_cmap(colorscale)
     match plot_with:
         case "plotly":
@@ -268,8 +272,8 @@ def analyze_svd(
             fig.add_trace(
                 go.Heatmap(
                     z=utils.to_numpy(U),
-                    zmin=-uzmax,
-                    zmax=uzmax,
+                    zmin=-zmax,
+                    zmax=zmax,
                     colorscale=colorscale,
                     zmid=0,
                     showscale=False,
@@ -282,10 +286,10 @@ def analyze_svd(
                 go.Heatmap(
                     z=utils.to_numpy(V),
                     colorscale=colorscale,
-                    zmin=-vzmax,
-                    zmax=vzmax,
+                    zmin=-zmax,
+                    zmax=zmax,
                     zmid=0,
-                    showscale=False,
+                    showscale=not remove_colorbar,
                     hovertemplate="V: %{y}<br>Singular Index: %{x}<br>Value: %{z}<extra></extra>",
                 ),
                 row=1,
@@ -332,15 +336,17 @@ def analyze_svd(
             fig.update_yaxes(range=[0, None], row=1, col=2)
             # fig.update_yaxes(title_text="Key Token", row=1, col=3)
 
-            fig.show(renderer)
+            if show:
+                fig.show(renderer)
 
             # line(S, title=f"Singular Values{descr}")
             # imshow(U, title=f"Principal Components on U{descr}")
             # imshow(Vh, title=f"Principal Components on Vh{descr}")
         case "matplotlib":
             fig, axs = plt.subplots(1, 3, figsize=figsize)
-            cax_u = axs[0].imshow(utils.to_numpy(U), cmap=cmap, vmin=-uzmax, vmax=uzmax)
-            axs[0].set_title("U")
+            plt.close()
+            cax_u = axs[0].imshow(utils.to_numpy(U), cmap=cmap, vmin=-zmax, vmax=zmax)
+            axs[0].set_title("$U$")
             fig.colorbar(cax_u, ax=axs[0], orientation="vertical").remove()
 
             axs[1].plot(
@@ -353,13 +359,12 @@ def analyze_svd(
             axs[1].set_title("Singular Values")
             axs[1].set_ylim(bottom=0)
 
-            cax_v = axs[2].matshow(
-                utils.to_numpy(V), cmap=cmap, vmin=-vzmax, vmax=vzmax
-            )
-            axs[2].set_title("V")
-            fig.colorbar(
-                cax_v, ax=axs[2], orientation="vertical"
-            ).remove()  # Remove colorbar if not needed
+            cax_v = axs[2].matshow(utils.to_numpy(V), cmap=cmap, vmin=-zmax, vmax=zmax)
+            axs[2].set_title("$V$")
+            if remove_colorbar:
+                fig.colorbar(
+                    cax_v, ax=axs[2], orientation="vertical"
+                ).remove()  # Remove colorbar if not needed
 
             for ax, ax_m in zip(axs, (U, None, V)):
                 ax.tick_params(
@@ -385,13 +390,16 @@ def analyze_svd(
                     # ax.set_yticklabels([f"{int(tick)}" for tick in yticks])
 
             fig.suptitle(f"SVD{descr}")
-            plt.tight_layout(pad=3.0)
-            plt.show()
+            fig.tight_layout(pad=3.0)
+            if show:
+                plt.figure(fig)
+                plt.show()
             fig.suptitle("")
             axs[1].set_title(f"Singular Values{descr}")
-            plt.figure(fig)
-            plt.show()
-    return fig
+            if show:
+                plt.figure(fig)
+                plt.show()
+    return fig, zmax
 
 
 @torch.no_grad()

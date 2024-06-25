@@ -1,5 +1,6 @@
 from typing import Optional, Literal, Union, Sequence, Collection
 import numpy as np
+import scipy.stats as stats
 from torch import Tensor
 from jaxtyping import Integer, Float
 import torch
@@ -139,3 +140,99 @@ def weighted_quantile(
     else:
         weighted_quantiles /= sample_weight.sum()
     return np.interp(quantiles, weighted_quantiles, values)
+
+
+def data_summary_percentiles():
+    s = twenty_five_percent_in_std_dev = stats.norm.ppf(0.75)
+    percentiles = stats.norm.cdf([-3 * s, -2 * s, -s, 0, s, 2 * s, 3 * s])
+    percentile_names = [
+        "LowerWhiskerBottomEnd",
+        "LowerWhiskerCrosshatch",
+        "QuartileOne",
+        "Median",
+        "QuartileThree",
+        "UpperWhiskerCrosshatch",
+        "UpperWhiskerTopEnd",
+    ]
+    return percentile_names, percentiles
+
+
+def data_summary(
+    data,
+    sample_weight: Optional[Float[Union[Tensor, np.ndarray], "..."]] = None,
+    prefix: str = "",
+    float_postfix: str = "Float",
+    int_postfix: str = "",
+):
+    if isinstance(data, dict):
+        keys = list(sorted(data.keys()))
+        values = [data[k] for k in keys]
+        weights = None if sample_weight is None else [sample_weight[k] for k in keys]
+    else:
+        keys = None
+        values = data
+        weights = sample_weight
+    if isinstance(values, torch.Tensor):
+        values = values.cpu().numpy()
+    elif not isinstance(values, np.ndarray):
+        values = np.array(values)  # turn to float
+    if isinstance(weights, torch.Tensor):
+        weights = weights.cpu().numpy()
+    elif not isinstance(weights, np.ndarray):
+        weights = np.array(weights, dtype=np.int64) if weights is not None else None
+
+    wf = lambda k: f"{prefix}{k}{float_postfix}"
+
+    result = {
+        f"{prefix}Len{int_postfix}": (
+            len(values.flatten()) if weights is None else int(weights.sum())
+        ),
+        wf("Min"): values.min(),
+        wf("Max"): values.max(),
+    }
+    values = values + 0.0  # floatify
+    result |= {
+        wf("Mean"): (
+            values.mean() if weights is None else np.average(values, weights=weights)
+        ),
+        wf("StdDev"): (
+            values.std()
+            if weights is None
+            else np.sqrt(np.average((values - values.mean()) ** 2, weights=weights))
+        ),
+        wf("SqrMean"): (
+            (values**2).mean()
+            if weights is None
+            else np.average(values**2, weights=weights)
+        ),
+    }
+
+    percentile_names, percentiles = data_summary_percentiles()
+    percentile_values = (
+        np.percentile(values, percentiles)
+        if weights is None
+        else weighted_quantile(values, percentiles, weights)
+    )
+
+    result.update({wf(pct): v for pct, v in zip(percentile_names, percentile_values)})
+
+    if keys is not None:
+        closest_keys = {}
+
+        def find_closest_key(value):
+            return keys[np.argmin(np.abs(values - value))]
+
+        closest_keys.update(
+            {
+                f"{prefix}MeanKey": find_closest_key(result[wf("Mean")]),
+                f"{prefix}MinKey": find_closest_key(result[wf("Min")]),
+                f"{prefix}MaxKey": find_closest_key(result[wf("Max")]),
+            }
+        )
+
+        for pct, value in zip(percentile_names, percentile_values):
+            closest_keys[f"{prefix}{pct}Key"] = find_closest_key(value)
+
+        result.update(closest_keys)
+
+    return result

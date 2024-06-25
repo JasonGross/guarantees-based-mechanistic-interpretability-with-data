@@ -1,10 +1,12 @@
-from typing import Union, Optional
+from typing import Union, Optional, Sequence
+import shutil
 import tempfile
 import subprocess
 from pathlib import Path
 from PIL import Image, ImageChops
 import io
 import plotly.graph_objects as go
+from tqdm.auto import tqdm
 
 
 def trim(im: Image.Image, border_color=None) -> Image.Image:
@@ -30,10 +32,55 @@ def trim_plotly_figure(
     return fig
 
 
-def optipng(*images: Union[str, Path], level: int = 5):
+def remove_bak(*files: Union[str, Path], save_bak: bool = True, ext: str = ".bak"):
+    file_paths = [Path(file) for file in files]
+    bak_files = [file.with_suffix(file.suffix + ext) for file in file_paths]
+    extant_bak_files = [bak_file for bak_file in bak_files if bak_file.exists()]
+    if save_bak:
+        if extant_bak_files:
+            remove_bak(*extant_bak_files, save_bak=save_bak, ext=ext)
+        for bak_file in extant_bak_files:
+            bak_file.rename(bak_file.with_suffix(bak_file.suffix + ext))
+    else:
+        for bak_file in extant_bak_files:
+            bak_file.unlink()
+
+
+def ect(
+    *images: Union[str, Path],
+    level: Optional[int] = None,
+    exhaustive: bool = False,
+    strip: bool = True,
+    strict: bool = True,
+    extra_args: Sequence[str] = (),
+):
     if not images:
         return
-    return subprocess.run(["optipng", f"-o{level}", *images], check=True)
+    if level is None and exhaustive:
+        level = 9
+    extra_args = list(extra_args)
+    if level is not None:
+        extra_args.append(f"-{level}")
+    if strip:
+        extra_args.append("-strip")
+    if strict:
+        extra_args.append("--strict")
+    return subprocess.run(["ect", *extra_args, *images], check=True)
+
+
+def optipng(
+    *images: Union[str, Path],
+    level: int = 5,
+    exhaustive: bool = False,
+    save_bak: bool = True,
+):
+    if not images:
+        return
+    if level == 5 and exhaustive:
+        level = 7
+    extra_args = [] if not exhaustive else ["-zm1-9"]
+    remove_bak(*images, save_bak=save_bak)
+    return subprocess.run(["optipng", f"-o{level}", *extra_args, *images], check=True)
 
 
 def pngcrush(
@@ -81,3 +128,26 @@ def pngcrush(
 
     if cleanup:
         cleanup()
+
+
+def optimize(
+    *images: Union[str, Path],
+    exhaustive: bool = True,
+    tmpdir: Optional[Union[str, Path]] = None,
+    cleanup: Optional[bool] = None,
+):
+    cur_images = images
+    cur_sizes = [Path(image).stat().st_size for image in cur_images]
+    while cur_images:
+        if shutil.which("ect"):
+            for img in tqdm(cur_images, desc="ect"):
+                ect(img, exhaustive=exhaustive)
+        optipng(*cur_images, exhaustive=exhaustive)
+        pngcrush(*cur_images, brute=exhaustive, tmpdir=tmpdir, cleanup=cleanup)
+        new_sizes = [Path(image).stat().st_size for image in cur_images]
+        cur_images = [
+            image
+            for image, old_size, new_size in zip(cur_images, cur_sizes, new_sizes)
+            if new_size < old_size
+        ]
+        cur_sizes = [Path(image).stat().st_size for image in cur_images]
