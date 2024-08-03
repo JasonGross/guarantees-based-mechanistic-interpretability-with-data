@@ -91,7 +91,7 @@ jobs:
       run: ect -h
 
   seeds:
-    if: false
+    # if: false
     strategy:
       fail-fast: false
       matrix:
@@ -123,9 +123,9 @@ jobs:
         poetry-install-extra-args: [""]
         os: [ubuntu-latest]
         cfg:
-          - { nctx: 4, dvocab: 64, extra-args: "--brute-force", extra-args-file-descr: "brute-force" }
-          - { nctx: 5, dvocab: 64, extra-args: "", extra-args-file-descr: "" }
-          - { nctx: 10, dvocab: 64, extra-args: "", extra-args-file-descr: "" }
+          # - { nctx: 4, dvocab: 64, extra-args: "--brute-force", extra-args-file-descr: "brute-force" }
+          # - { nctx: 5, dvocab: 64, extra-args: "", extra-args-file-descr: "" }
+          # - { nctx: 10, dvocab: 64, extra-args: "", extra-args-file-descr: "" }
           - { nctx: 10, dvocab: 128, extra-args: "", extra-args-file-descr: "" }
     needs: [install-deps, build-e-c-t]
     runs-on: ${{ matrix.os }}
