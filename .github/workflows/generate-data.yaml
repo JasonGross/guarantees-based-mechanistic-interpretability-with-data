@@ -109,7 +109,7 @@ jobs:
       matrix:
         cfg:
           - { nctx: 4, dvocab: 64, extra-args: "--brute-force", extra-args-file-descr: "brute-force", default-extra-args: "" }
-          - { nctx: 5, dvocab: 64, extra-args: "", extra-args-file-descr: "", default-extra-args: "" }
+          - { nctx: 5, dvocab: 64, extra-args: "", extra-args-file-descr: "", default-extra-args: "--no-plots" }
           - { nctx: 10, dvocab: 64, extra-args: "", extra-args-file-descr: "", default-extra-args: "--no-plots" }
           - { nctx: 10, dvocab: 128, extra-args: "", extra-args-file-descr: "", default-extra-args: "--no-plots" }
           - { nctx: 20, dvocab: 64, extra-args: "", extra-args-file-descr: "", default-extra-args: "--no-plots" }
