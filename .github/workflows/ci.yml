@@ -124,7 +124,7 @@ jobs:
         os: [ubuntu-latest]
         cfg:
           # - { nctx: 4, dvocab: 64, extra-args: "--brute-force", extra-args-file-descr: "brute-force" }
-          - { nctx: 5, dvocab: 64, extra-args: "", extra-args-file-descr: "" }
+          - { nctx: 5, dvocab: 64, extra-args: "--no-plots", extra-args-file-descr: "" }
           # - { nctx: 10, dvocab: 64, extra-args: "", extra-args-file-descr: "" }
           # - { nctx: 10, dvocab: 128, extra-args: "", extra-args-file-descr: "" }
     needs: [install-deps, build-e-c-t]
