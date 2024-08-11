@@ -147,7 +147,7 @@ jobs:
         default-extra-args: ${{ steps.check-branch.outputs.default-extra-args }}
 
   seeds:
-    # if: false
+    if: false
     strategy:
       fail-fast: false
       matrix:
