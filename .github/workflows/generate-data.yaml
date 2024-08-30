@@ -310,4 +310,4 @@ jobs:
       - name: Merge Artifacts
         uses: actions/upload-artifact/merge@v4
         with:
-          retention-days: 3
+          retention-days: 10
