@@ -139,7 +139,7 @@ jobs:
         cfg: ${{ steps.check-branch.outputs.cfg }}
 
   seeds:
-    if: false
+    # if: false
     strategy:
       fail-fast: false
       matrix:
